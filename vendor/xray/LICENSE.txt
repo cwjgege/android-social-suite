@@ -1,0 +1,11 @@
+Xray-core v25.10.15
+
+This product bundles an unmodified official Windows x64 build of Xray-core as a separate executable.
+Xray-core is licensed under the Mozilla Public License 2.0.
+
+Upstream source: https://github.com/XTLS/Xray-core
+Version source: https://github.com/XTLS/Xray-core/tree/v25.10.15
+License text: https://www.mozilla.org/MPL/2.0/
+Upstream license: https://github.com/XTLS/Xray-core/blob/main/LICENSE
+
+Android Social Suite and Xray-core are separate programs. Xray-core remains governed by its upstream license.

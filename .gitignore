@@ -1,0 +1,34 @@
+# Local Android runtimes and generated state
+android-home/
+android-jdk/
+sdk-home/
+work/
+outputs/
+.zxing-src-*/
+qa/
+design-qa.md
+.knownPackages
+
+# Local diagnostics and captures
+*.log
+*.tmp
+*.ok
+*.png
+*.json
+!assets/android-social-suite-icon.png
+!docs/design/device-gallery-selected.png
+
+# Generated executables; only the curated release artifact is tracked
+AndroidSocialSuite*.exe
+!release/AndroidSocialSuite.exe
+node-download-helper.exe
+ZXing.Net.*.zip
+
+# User and IDE files
+.git/
+.git-upload/
+.vs/
+.vscode/
+*.user
+Thumbs.db
+Desktop.ini

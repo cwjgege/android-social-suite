@@ -1,0 +1,56 @@
+param(
+    [string]$Configuration = 'Release'
+)
+
+$ErrorActionPreference = 'Stop'
+$root = $PSScriptRoot
+$releaseDirectory = Join-Path $root 'release'
+$output = Join-Path $releaseDirectory 'AndroidSocialSuite.exe'
+$compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+$xrayExe = Join-Path $root 'vendor\xray\xray.exe'
+$xrayLicense = Join-Path $root 'vendor\xray\LICENSE.txt'
+$zxingDll = Join-Path $root 'vendor\zxing\zxing.dll'
+$zxingLicense = Join-Path $root 'vendor\zxing\LICENSE.txt'
+$appIcon = Join-Path $root 'assets\android-social-suite.ico'
+$appIconPng = Join-Path $root 'assets\android-social-suite-icon.png'
+
+if (-not (Test-Path -LiteralPath $compiler)) {
+    throw 'The 64-bit .NET Framework C# compiler was not found.'
+}
+if (-not (Test-Path -LiteralPath $xrayExe) -or -not (Test-Path -LiteralPath $xrayLicense)) {
+    throw 'Embedded Xray files are missing. Run .\fetch-xray.ps1 first.'
+}
+if (-not (Test-Path -LiteralPath $zxingDll) -or -not (Test-Path -LiteralPath $zxingLicense)) {
+    throw 'Embedded ZXing.Net files are missing. Run .\fetch-zxing.ps1 first.'
+}
+if (-not (Test-Path -LiteralPath $appIcon)) { throw "Application icon is missing: $appIcon" }
+if (-not (Test-Path -LiteralPath $appIconPng)) { throw "Application icon image is missing: $appIconPng" }
+
+[void](New-Item -ItemType Directory -Path $releaseDirectory -Force)
+
+& $compiler `
+    /nologo `
+    /target:winexe `
+    /optimize+ `
+    /platform:anycpu `
+    "/win32icon:$appIcon" `
+    /reference:System.Windows.Forms.dll `
+    "/out:$output" `
+    "/resource:$root\android-social-suite.ps1,android-social-suite.ps1" `
+    "/resource:$root\android-avd-manager.ps1,android-avd-manager.ps1" `
+    "/resource:$xrayExe,xray.exe" `
+    "/resource:$xrayLicense,XRAY-LICENSE.txt" `
+    "/resource:$zxingDll,zxing.dll" `
+    "/resource:$zxingLicense,ZXING-LICENSE.txt" `
+    "/resource:$appIcon,app-icon.ico" `
+    "/resource:$appIconPng,app-icon.png" `
+    "$root\AndroidSocialSuiteLauncher.cs"
+
+
+if ($LASTEXITCODE -ne 0) {
+    throw "Build failed with exit code $LASTEXITCODE."
+}
+
+$hash = (Get-FileHash -LiteralPath $output -Algorithm SHA256).Hash
+Write-Output "Built: $output"
+Write-Output "SHA256: $hash"
