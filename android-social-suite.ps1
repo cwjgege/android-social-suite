@@ -135,7 +135,22 @@ function Install-Archive {
 
     $parent = Split-Path $Destination -Parent
     [void](New-Item -ItemType Directory -Path $parent -Force)
+    if (Test-Path -LiteralPath $Destination) {
+        [IO.Directory]::Delete($Destination, $true)
+    }
     [IO.Directory]::Move($source, $Destination)
+}
+
+function Get-AndroidEnvironmentState {
+    param([string]$Root)
+
+    $sdkRoot = Join-Path $Root 'android-sdk'
+    [pscustomobject]@{
+        Emulator = Test-Path -LiteralPath (Join-Path $sdkRoot 'emulator\emulator.exe') -PathType Leaf
+        PlatformTools = Test-Path -LiteralPath (Join-Path $sdkRoot 'platform-tools\adb.exe') -PathType Leaf
+        SystemImage = Test-Path -LiteralPath (Join-Path $sdkRoot 'system-images\android-34\google_apis_playstore\x86_64\system.img') -PathType Leaf
+        Template = Test-Path -LiteralPath (Join-Path $Root 'android-avd\social_template.avd\config.ini') -PathType Leaf
+    }
 }
 
 function Install-XrayCore {
@@ -272,8 +287,21 @@ function Install-AndroidEnvironment {
         throw ('At least 24 GB of free space is required on {0}. Available: {1:N1} GB.' -f $rootDrive.Name, ($rootDrive.AvailableFreeSpace / 1GB))
     }
 
+    $state = Get-AndroidEnvironmentState $Root
+    $missing = [Collections.Generic.List[string]]::new()
+    if (-not $state.Emulator) { $missing.Add('Android Emulator') }
+    if (-not $state.PlatformTools) { $missing.Add('Platform Tools') }
+    if (-not $state.SystemImage) { $missing.Add('Android 14 Google Play image') }
+    if (-not $state.Template) { $missing.Add('device template') }
+    if ($missing.Count -eq 0) { return }
+
+    $downloadNotice = if ($missing.Count -eq 1 -and $missing[0] -eq 'device template') {
+        'No large download is required.'
+    } else {
+        'Only missing Android components will be downloaded. Existing SDK files, phones, apps, media, and proxy bindings will be reused.'
+    }
     $answer = [System.Windows.Forms.MessageBox]::Show(
-        "First-time setup downloads Android Emulator, Platform Tools, and an Android 14 Google Play system image directly from Google.`r`n`r`nInstall location: $Root`r`nExpected download: several GB`r`n`r`nBy selecting Yes, you confirm that you have reviewed and accept the Android SDK License Agreement:`r`n$($script:TermsUrl)",
+        "Android Social Suite needs to install or repair: $($missing -join ', ').`r`n`r`nInstall location: $Root`r`n$downloadNotice`r`n`r`nBy selecting Yes, you confirm that you have reviewed and accept the Android SDK License Agreement:`r`n$($script:TermsUrl)",
         $script:ProductName,
         [System.Windows.Forms.MessageBoxButtons]::YesNo,
         [System.Windows.Forms.MessageBoxIcon]::Information
@@ -309,29 +337,39 @@ function Install-AndroidEnvironment {
         [void](New-Item -ItemType Directory -Path (Join-Path $Root 'android-avd') -Force)
         [void](New-Item -ItemType Directory -Path (Join-Path $Root 'emulator-home') -Force)
 
-        $label.Text = 'Reading Google package metadata...'
-        [System.Windows.Forms.Application]::DoEvents()
-        $emulator = Get-ArchiveInfo $script:RepositoryUrl 'emulator' $script:RepositoryBaseUrl -WindowsOnly
-        $platformTools = Get-ArchiveInfo $script:RepositoryUrl 'platform-tools' $script:RepositoryBaseUrl -WindowsOnly
-        $systemImage = Get-ArchiveInfo $script:SystemImageRepositoryUrl $script:SystemImagePackage $script:SystemImageBaseUrl
-
         $sdkRoot = Join-Path $Root 'android-sdk'
-        $label.Text = 'Downloading and installing Android Emulator...'
-        [System.Windows.Forms.Application]::DoEvents()
-        Install-Archive $emulator 'emulator' (Join-Path $sdkRoot 'emulator') $workRoot
-
-        $label.Text = 'Downloading and installing Platform Tools...'
-        [System.Windows.Forms.Application]::DoEvents()
-        Install-Archive $platformTools 'platform-tools' (Join-Path $sdkRoot 'platform-tools') $workRoot
-
-        $label.Text = 'Downloading Android 14 Google Play image. This is the largest step...'
-        [System.Windows.Forms.Application]::DoEvents()
-        Install-Archive $systemImage 'x86_64' (Join-Path $sdkRoot 'system-images\android-34\google_apis_playstore\x86_64') $workRoot
-
-        $label.Text = 'Creating the protected template and first phone...'
-        [System.Windows.Forms.Application]::DoEvents()
-        New-BaseAvd $Root 'social_template'
-        New-BaseAvd $Root 'social_phone_01'
+        if (-not $state.Emulator -or -not $state.PlatformTools) {
+            $label.Text = 'Reading Google package metadata...'
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+        if (-not $state.Emulator) {
+            $emulator = Get-ArchiveInfo $script:RepositoryUrl 'emulator' $script:RepositoryBaseUrl -WindowsOnly
+            $label.Text = 'Downloading and installing Android Emulator...'
+            [System.Windows.Forms.Application]::DoEvents()
+            Install-Archive $emulator 'emulator' (Join-Path $sdkRoot 'emulator') $workRoot
+        }
+        if (-not $state.PlatformTools) {
+            $platformTools = Get-ArchiveInfo $script:RepositoryUrl 'platform-tools' $script:RepositoryBaseUrl -WindowsOnly
+            $label.Text = 'Downloading and installing Platform Tools...'
+            [System.Windows.Forms.Application]::DoEvents()
+            Install-Archive $platformTools 'platform-tools' (Join-Path $sdkRoot 'platform-tools') $workRoot
+        }
+        if (-not $state.SystemImage) {
+            $label.Text = 'Reading Android system image metadata...'
+            [System.Windows.Forms.Application]::DoEvents()
+            $systemImage = Get-ArchiveInfo $script:SystemImageRepositoryUrl $script:SystemImagePackage $script:SystemImageBaseUrl
+            $label.Text = 'Downloading Android 14 Google Play image. This is the largest step...'
+            [System.Windows.Forms.Application]::DoEvents()
+            Install-Archive $systemImage 'x86_64' (Join-Path $sdkRoot 'system-images\android-34\google_apis_playstore\x86_64') $workRoot
+        }
+        if (-not $state.Template) {
+            $label.Text = 'Creating the protected device template...'
+            [System.Windows.Forms.Application]::DoEvents()
+            New-BaseAvd $Root 'social_template'
+        }
+        if (-not (Test-Path -LiteralPath (Join-Path $Root 'android-avd\social_phone_01.ini'))) {
+            New-BaseAvd $Root 'social_phone_01'
+        }
     }
     finally {
         $progress.Close()
@@ -352,8 +390,8 @@ function Install-AndroidEnvironment {
 try {
     Add-Type -AssemblyName Microsoft.VisualBasic
     $root = Get-InstallRoot
-    $emulatorExe = Join-Path $root 'android-sdk\emulator\emulator.exe'
-    if (-not (Test-Path -LiteralPath $emulatorExe)) {
+    $environmentState = Get-AndroidEnvironmentState $root
+    if (-not ($environmentState.Emulator -and $environmentState.PlatformTools -and $environmentState.SystemImage -and $environmentState.Template)) {
         Install-AndroidEnvironment $root
     }
 

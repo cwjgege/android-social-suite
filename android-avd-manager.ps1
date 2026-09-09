@@ -101,6 +101,7 @@ $script:ProfileRoot = Join-Path $script:BaseRoot 'proxy-profiles'
 $script:RuntimeRoot = Join-Path $script:BaseRoot 'proxy-runtime'
 $script:BindingsFile = Join-Path $script:ProfileRoot 'bindings.json'
 $script:InitializingDevices = $false
+$script:GuestProxyCleared = @{}
 $script:DeviceProfiles = @(
     [pscustomobject]@{ Label = 'Google Pixel 4'; DeviceName = 'pixel_4'; Manufacturer = 'Google'; Width = 1080; Height = 2280; Density = 440; Ram = '1536M'; Cores = 2 },
     [pscustomobject]@{ Label = 'Google Pixel 5'; DeviceName = 'pixel_5'; Manufacturer = 'Google'; Width = 1080; Height = 2340; Density = 440; Ram = '1536M'; Cores = 2 },
@@ -1375,13 +1376,14 @@ function Initialize-RunningDevices {
             if ($binding) {
                 $proxyPort = [int]$binding.port
                 if (-not (Test-TcpPort $proxyPort)) { [void](Start-XrayForAvd $name) }
-                $desiredGuestProxy = "10.0.2.2:$proxyPort"
-            } else {
-                $desiredGuestProxy = ':0'
             }
-            $currentGuestProxy = (& $script:AdbExe -s $serial shell settings get global http_proxy 2>$null).Trim()
-            if ($currentGuestProxy -ne $desiredGuestProxy) {
-                & $script:AdbExe -s $serial shell settings put global http_proxy $desiredGuestProxy 2>$null | Out-Null
+
+            if (-not $script:GuestProxyCleared.ContainsKey($name)) {
+                foreach ($key in @('http_proxy', 'global_http_proxy_host', 'global_http_proxy_port', 'global_http_proxy_exclusion_list', 'proxy_pac_url')) {
+                    & $script:AdbExe -s $serial shell settings delete global $key 2>$null | Out-Null
+                    if ($LASTEXITCODE -ne 0) { throw "Unable to clear Android system proxy setting: $key" }
+                }
+                $script:GuestProxyCleared[$name] = $true
             }
 
             $marker = Join-Path $script:AvdRoot ($name + '.avd\.per_device_proxy_v1')
@@ -1389,7 +1391,7 @@ function Initialize-RunningDevices {
             & $script:AdbExe -s $serial shell cmd media_session volume --stream 3 --set 15 2>$null | Out-Null
             if ($LASTEXITCODE -ne 0) { & $script:AdbExe -s $serial shell 'for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do input keyevent 24; done' 2>$null | Out-Null }
             [IO.File]::WriteAllText($marker, (Get-Date).ToString('o'), [Text.UTF8Encoding]::new($false))
-            Set-Status "$name initialized: Android proxy $desiredGuestProxy active, media volume maximum."
+            Set-Status "$name initialized: single emulator proxy active, Android system proxy cleared, media volume maximum."
         }
     } catch {
         if ($_.Exception.Message -notmatch '(?i)error:\s*(closed|offline)|device.*not found') {
