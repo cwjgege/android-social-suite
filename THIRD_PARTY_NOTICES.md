@@ -29,6 +29,15 @@ Android Social Suite does not grant rights to redistribute Google SDK components
 - Purpose: in-memory decoding of proxy QR codes displayed on connected screens
 - Privacy: screenshots are not saved to disk
 
+## hev-socks5-tunnel / SocksTun
+
+- Provider: hev and contributors
+- Repositories: https://github.com/heiher/hev-socks5-tunnel and https://github.com/heiher/sockstun
+- License: MIT
+- Embedded native version: SocksTun 8.0 / hev-socks5-tunnel Android x86_64 library
+- Purpose: per-device Android VpnService tunnel for TCP, UDP, IPv4, IPv6, and DNS traffic
+- Distribution model: the native library is embedded in the managed Android VPN APK and its license is embedded in the Windows release executable
+
 ## PowerShell and .NET Framework
 
 The launcher relies on Windows PowerShell and .NET Framework components supplied with supported Windows installations.

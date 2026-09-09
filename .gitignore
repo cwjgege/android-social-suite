@@ -8,6 +8,8 @@ outputs/
 qa/
 design-qa.md
 .knownPackages
+android-vpn/build/
+android-vpn/*.jks
 
 # Local diagnostics and captures
 *.log

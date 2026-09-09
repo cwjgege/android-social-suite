@@ -13,6 +13,8 @@ $zxingDll = Join-Path $root 'vendor\zxing\zxing.dll'
 $zxingLicense = Join-Path $root 'vendor\zxing\LICENSE.txt'
 $appIcon = Join-Path $root 'assets\android-social-suite.ico'
 $appIconPng = Join-Path $root 'assets\android-social-suite-icon.png'
+$tunnelApk = Join-Path $root 'vendor\android-vpn\android-social-tunnel.apk'
+$tunnelLicense = Join-Path $root 'vendor\android-vpn\HEV-SOCKS5-TUNNEL-LICENSE.txt'
 
 if (-not (Test-Path -LiteralPath $compiler)) {
     throw 'The 64-bit .NET Framework C# compiler was not found.'
@@ -25,6 +27,9 @@ if (-not (Test-Path -LiteralPath $zxingDll) -or -not (Test-Path -LiteralPath $zx
 }
 if (-not (Test-Path -LiteralPath $appIcon)) { throw "Application icon is missing: $appIcon" }
 if (-not (Test-Path -LiteralPath $appIconPng)) { throw "Application icon image is missing: $appIconPng" }
+if (-not (Test-Path -LiteralPath $tunnelApk) -or -not (Test-Path -LiteralPath $tunnelLicense)) {
+    throw 'Managed Android VPN files are missing. Run .\build-vpn.ps1 first.'
+}
 
 [void](New-Item -ItemType Directory -Path $releaseDirectory -Force)
 
@@ -44,6 +49,8 @@ if (-not (Test-Path -LiteralPath $appIconPng)) { throw "Application icon image i
     "/resource:$zxingLicense,ZXING-LICENSE.txt" `
     "/resource:$appIcon,app-icon.ico" `
     "/resource:$appIconPng,app-icon.png" `
+    "/resource:$tunnelApk,android-social-tunnel.apk" `
+    "/resource:$tunnelLicense,HEV-SOCKS5-TUNNEL-LICENSE.txt" `
     "$root\AndroidSocialSuiteLauncher.cs"
 
 

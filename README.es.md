@@ -9,7 +9,8 @@ Android Social Suite es un administrador local de múltiples dispositivos Androi
 ## Funciones
 
 - Crear, iniciar, detener y eliminar dispositivos Android 14 en Windows.
-- Asignar un proxy y un proceso Xray independiente a cada dispositivo.
+- Asignar un proxy, un proceso Xray y un tunel VPN Android independiente a cada dispositivo.
+- Enrutar TCP, UDP, IPv4, IPv6 y DNS mediante el componente integrado `VpnService + tun2socks`.
 - Importar enlaces VLESS, VMess, Trojan, Shadowsocks, SOCKS5 y HTTP/HTTPS.
 - Importar objetos JSON outbound de Xray para Hysteria, WireGuard y configuraciones avanzadas.
 - Cifrar enlaces y credenciales mediante Windows DPAPI.
@@ -21,7 +22,7 @@ Android Social Suite es un administrador local de múltiples dispositivos Androi
 
 ## Descarga y primer inicio
 
-Descarga `AndroidSocialSuite.exe` desde GitHub Releases. Xray-core está integrado en el EXE. El primer inicio requiere Internet para descargar Android Emulator, Platform Tools y la imagen Android 14 con Google Play desde Google.
+Descarga `AndroidSocialSuite.exe` desde GitHub Releases. Xray-core y el APK VPN administrado están integrados en el EXE. El primer inicio requiere Internet para descargar Android Emulator, Platform Tools y la imagen Android 14 con Google Play desde Google.
 
 Se requiere Windows de 64 bits, Intel VT-x o AMD-V/SVM y Windows Hypervisor Platform.
 

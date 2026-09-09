@@ -9,7 +9,8 @@ Android Social Suite is a local multi-device Android manager for Windows. It use
 ## Features
 
 - Create, start, stop, and delete Android 14 devices on Windows.
-- Assign a separate proxy and local Xray process to each phone.
+- Assign a separate proxy, local Xray process, and Android VPN tunnel to each phone.
+- Route device TCP, UDP, IPv4, IPv6, and DNS traffic through the embedded `VpnService + tun2socks` component instead of relying on Android's HTTP proxy.
 - Import VLESS, VMess, Trojan, Shadowsocks, SOCKS5, and HTTP/HTTPS links.
 - Import an Xray outbound JSON object for Hysteria, WireGuard, and advanced configurations.
 - Encrypt saved proxy links and credentials with Windows DPAPI.
@@ -24,7 +25,7 @@ Android Social Suite is a local multi-device Android manager for Windows. It use
 
 Download `AndroidSocialSuite.exe` from GitHub Releases. The repository's [release/AndroidSocialSuite.exe](release/AndroidSocialSuite.exe) is also provided for the current preview.
 
-Xray-core is embedded in the executable. The first run still requires internet access to download Android Emulator, Platform Tools, and the Android 14 Google Play image from Google. These components are reused on later launches.
+Xray-core and the managed VPN APK are embedded in the executable. The first run still requires internet access to download Android Emulator, Platform Tools, and the Android 14 Google Play image from Google. These components are reused on later launches.
 
 ## Quick start
 
@@ -52,7 +53,7 @@ Follow the [screenshot checklist](docs/SCREENSHOTS.md) before publishing real sc
 
 ## Third-party software
 
-This repository does not include Android SDK or Google Play system images. Release executables embed an unmodified Xray-core binary with its MPL 2.0 notice. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+This repository does not include Android SDK or Google Play system images. Release executables embed an unmodified Xray-core binary and an MIT-licensed hev-socks5-tunnel Android VPN component. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## License
 

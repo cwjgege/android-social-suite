@@ -9,7 +9,8 @@ Android Social Suite は、Windows 向けのローカル Android マルチデバ
 ## 主な機能
 
 - Windows 上で Android 14 デバイスを作成、起動、停止、削除。
-- デバイスごとに異なるプロキシと Xray プロセスを割り当て。
+- デバイスごとに異なるプロキシ、Xray プロセス、Android VPN トンネルを割り当て。
+- 内蔵の `VpnService + tun2socks` で TCP、UDP、IPv4、IPv6、DNS を経由。
 - VLESS、VMess、Trojan、Shadowsocks、SOCKS5、HTTP/HTTPS を直接読み込み。
 - Hysteria、WireGuard、高度な設定は Xray outbound JSON で読み込み。
 - プロキシ情報を Windows DPAPI で暗号化。
@@ -21,7 +22,7 @@ Android Social Suite は、Windows 向けのローカル Android マルチデバ
 
 ## ダウンロードと初回起動
 
-GitHub Releases から `AndroidSocialSuite.exe` をダウンロードしてください。Xray-core は EXE に内蔵されています。初回起動時は Android コンポーネントを Google の公式配布元から取得するため、インターネット接続が必要です。
+GitHub Releases から `AndroidSocialSuite.exe` をダウンロードしてください。Xray-core と管理対象 VPN APK は EXE に内蔵されています。初回起動時は Android コンポーネントを Google の公式配布元から取得するため、インターネット接続が必要です。
 
 Intel VT-x または AMD-V/SVM と Windows Hypervisor Platform を有効にし、Windows を再起動してから使用してください。
 

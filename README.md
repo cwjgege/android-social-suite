@@ -9,7 +9,8 @@ Android Social Suite 是面向 Windows 用户的本地 Android 多设备管理�
 ## 功能
 
 - 在 Windows 上创建、启动、关闭和删除 Android 14 设备。
-- 为每台设备分配独立代理和本地 Xray 进程。
+- 为每台设备分配独立代理、本地 Xray 进程和 Android VPN 隧道。
+- 通过内置 `VpnService + tun2socks` 接管设备的 TCP、UDP、IPv4、IPv6 和 DNS 流量，避免应用绕过系统 HTTP 代理。
 - 直接识别 VLESS、VMess、Trojan、Shadowsocks、SOCKS5 和 HTTP/HTTPS 分享链接。
 - 通过 Xray outbound JSON 支持 Hysteria、WireGuard 和高级配置。
 - 使用 Windows DPAPI 加密保存代理分享链接及凭据。
@@ -24,7 +25,7 @@ Android Social Suite 是面向 Windows 用户的本地 Android 多设备管理�
 
 从 GitHub Releases 下载 `AndroidSocialSuite.exe`。仓库内的 [release/AndroidSocialSuite.exe](release/AndroidSocialSuite.exe) 也用于当前预览版本。
 
-Xray 核心已嵌入 EXE。首次运行仍需联网从 Google 官方源下载 Android Emulator、Platform Tools 和 Android 14 Google Play 镜像，后续启动不需要重复下载。
+Xray 核心和受管 VPN APK 已嵌入 EXE。首次运行仍需联网从 Google 官方源下载 Android Emulator、Platform Tools 和 Android 14 Google Play 镜像，后续启动不需要重复下载。
 
 ## 快速开始
 
@@ -58,7 +59,7 @@ VLESS 分享链接使用 Windows DPAPI 加密存放。设备运行时，Xray 需
 
 ## 第三方组件
 
-本仓库不包含 Android SDK 或 Google Play 系统镜像。发布版 EXE 嵌入未修改的 Xray 核心并附带 MPL 2.0 声明。详情参见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+本仓库不包含 Android SDK 或 Google Play 系统镜像。发布版 EXE 嵌入未修改的 Xray 核心以及基于 MIT 许可 hev-socks5-tunnel 的受管 Android VPN 组件。详情参见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 ## 开源许可
 

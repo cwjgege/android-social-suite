@@ -27,6 +27,8 @@ internal static class AndroidSocialSuiteLauncher
             string zxingLicensePath = Path.Combine(extractionRoot, "ZXING-LICENSE.txt");
             string iconPath = Path.Combine(extractionRoot, "app-icon.ico");
             string iconImagePath = Path.Combine(extractionRoot, "app-icon.png");
+            string tunnelApkPath = Path.Combine(extractionRoot, "android-social-tunnel.apk");
+            string tunnelLicensePath = Path.Combine(extractionRoot, "HEV-SOCKS5-TUNNEL-LICENSE.txt");
             ExtractResource("android-social-suite.ps1", suitePath);
             ExtractResource("android-avd-manager.ps1", managerPath);
             ExtractResource("xray.exe", xrayPath);
@@ -35,6 +37,8 @@ internal static class AndroidSocialSuiteLauncher
             ExtractResource("ZXING-LICENSE.txt", zxingLicensePath);
             ExtractResource("app-icon.ico", iconPath);
             ExtractResource("app-icon.png", iconImagePath);
+            ExtractResource("android-social-tunnel.apk", tunnelApkPath);
+            ExtractResource("HEV-SOCKS5-TUNNEL-LICENSE.txt", tunnelLicensePath);
 
             ProcessStartInfo startInfo = new ProcessStartInfo();
             startInfo.FileName = Path.Combine(

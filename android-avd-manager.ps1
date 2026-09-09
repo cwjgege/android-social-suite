@@ -91,6 +91,10 @@ $script:SdkRoot = Join-Path $script:BaseRoot 'android-sdk'
 $script:EmulatorHome = Join-Path $script:BaseRoot 'emulator-home'
 $script:EmulatorExe = Join-Path $script:SdkRoot 'emulator\emulator.exe'
 $script:AdbExe = Join-Path $script:SdkRoot 'platform-tools\adb.exe'
+$script:TunnelApk = Join-Path $PSScriptRoot 'android-social-tunnel.apk'
+$script:TunnelPackage = 'com.android.socialsuite.vpn'
+$script:TunnelReceiver = 'com.android.socialsuite.vpn/.TunnelControlReceiver'
+$script:TunnelVersionCode = 13
 $script:AdbKey = Join-Path $env:USERPROFILE '.android\adbkey'
 $script:TemplateName = 'social_template'
 $script:SharedProxyPort = 10808
@@ -540,9 +544,24 @@ function New-ProxyEnvelope {
     else { $Outbound | Add-Member -NotePropertyName tag -NotePropertyValue 'proxy-out' -Force }
     [ordered]@{
         log = [ordered]@{ loglevel = 'warning' }
-        inbounds = @([ordered]@{ tag = 'android-http-in'; listen = '127.0.0.1'; port = $Port; protocol = 'http'; settings = [ordered]@{ timeout = 30 } })
+        inbounds = @(
+            [ordered]@{
+                tag = 'android-socks-in'
+                listen = '127.0.0.1'
+                port = $Port
+                protocol = 'socks'
+                settings = [ordered]@{ auth = 'noauth'; udp = $true; ip = '127.0.0.1' }
+            },
+            [ordered]@{
+                tag = 'proxy-test-http-in'
+                listen = '127.0.0.1'
+                port = ($Port + 1000)
+                protocol = 'http'
+                settings = [ordered]@{ timeout = 30 }
+            }
+        )
         outbounds = @($Outbound, [ordered]@{ tag = 'blocked'; protocol = 'blackhole' })
-        routing = [ordered]@{ domainStrategy = 'AsIs'; rules = @([ordered]@{ type = 'field'; inboundTag = @('android-http-in'); outboundTag = 'proxy-out' }) }
+        routing = [ordered]@{ domainStrategy = 'AsIs'; rules = @([ordered]@{ type = 'field'; inboundTag = @('android-socks-in', 'proxy-test-http-in'); outboundTag = 'proxy-out' }) }
     }
 }
 
@@ -718,6 +737,68 @@ function Stop-XrayForAvd {
     if (Test-Path -LiteralPath $configPath) {
         try { [IO.File]::Delete($configPath) } catch { }
     }
+}
+
+function Clear-AndroidSystemProxy {
+    param([string]$Serial)
+    & $script:AdbExe -s $Serial shell settings put global http_proxy ':0' 2>$null | Out-Null
+    foreach ($key in @('http_proxy', 'global_http_proxy_host', 'global_http_proxy_port', 'global_http_proxy_exclusion_list', 'global_proxy_pac_url', 'proxy_pac_url')) {
+        & $script:AdbExe -s $Serial shell settings delete global $key 2>$null | Out-Null
+    }
+}
+
+function Invoke-DeviceTunnelControl {
+    param(
+        [string]$Serial,
+        [ValidateSet('CONNECT', 'DISCONNECT', 'STATUS')][string]$Action,
+        [int]$Port = 0
+    )
+    $arguments = @('-s', $Serial, 'shell', 'am', 'broadcast', '--receiver-foreground', '-a', "com.android.socialsuite.vpn.$Action", '-n', $script:TunnelReceiver)
+    if ($Action -eq 'CONNECT') {
+        $arguments += @('--es', 'socks_host', '127.0.0.1', '--ei', 'socks_port', [string]$Port)
+    }
+    (& $script:AdbExe @arguments 2>&1 | Out-String).Trim()
+}
+
+function Ensure-DeviceTunnel {
+    param([string]$Serial, [string]$Name, [int]$Port)
+    if (-not (Test-Path -LiteralPath $script:TunnelApk -PathType Leaf)) {
+        throw 'The embedded Android VPN component is missing. Reinstall Android Social Suite.'
+    }
+
+    $packageInfo = (& $script:AdbExe -s $Serial shell dumpsys package $script:TunnelPackage 2>$null | Out-String)
+    $expectedVersion = "versionCode=$($script:TunnelVersionCode)"
+    if ($packageInfo -notmatch [Regex]::Escape($expectedVersion)) {
+        Set-Status "Installing the managed VPN component on $Name..."
+        $installOutput = (& $script:AdbExe -s $Serial install -r -g $script:TunnelApk 2>&1 | Out-String)
+        if ($LASTEXITCODE -ne 0 -or $installOutput -notmatch 'Success') {
+            & $script:AdbExe -s $Serial uninstall $script:TunnelPackage 2>$null | Out-Null
+            $installOutput = (& $script:AdbExe -s $Serial install -g $script:TunnelApk 2>&1 | Out-String)
+        }
+        if ($LASTEXITCODE -ne 0 -or $installOutput -notmatch 'Success') {
+            throw "Unable to install the managed VPN component: $($installOutput.Trim())"
+        }
+    }
+
+    & $script:AdbExe -s $Serial shell appops set $script:TunnelPackage ACTIVATE_VPN allow 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Unable to authorize the Android VPN service.' }
+    Clear-AndroidSystemProxy $Serial
+    & $script:AdbExe -s $Serial reverse --remove-all 2>$null | Out-Null
+    & $script:AdbExe -s $Serial reverse "tcp:$Port" "tcp:$Port" 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Unable to create the private ADB tunnel to Xray.' }
+    $connectOutput = Invoke-DeviceTunnelControl $Serial CONNECT $Port
+    if ($connectOutput -notmatch 'accepted=true') { throw "Unable to start the Android VPN service: $connectOutput" }
+    Start-Sleep -Milliseconds 900
+    $statusOutput = Invoke-DeviceTunnelControl $Serial STATUS
+    if ($statusOutput -notmatch 'running=true') { throw "The Android VPN service did not become ready: $statusOutput" }
+}
+
+function Stop-DeviceTunnel {
+    param([string]$Serial)
+    if (-not $Serial) { return }
+    [void](Invoke-DeviceTunnelControl $Serial DISCONNECT)
+    & $script:AdbExe -s $Serial reverse --remove-all 2>$null | Out-Null
+    Clear-AndroidSystemProxy $Serial
 }
 
 function Get-SelectedAvd {
@@ -1049,7 +1130,7 @@ function Test-PhoneProxy {
         $endpoint = Get-XrayEndpointFromConfig (Get-XrayConfigPath $name)
         $tcpLatency = if ($endpoint) { Measure-TcpLatency $endpoint.Host $endpoint.Port } else { $null }
         $proxyWatch = [Diagnostics.Stopwatch]::StartNew()
-        $response = Invoke-WebRequest -UseBasicParsing -Uri 'https://api.ipify.org' -Proxy ("http://127.0.0.1:$port") -TimeoutSec 15
+        $response = Invoke-WebRequest -UseBasicParsing -Uri 'https://api.ipify.org' -Proxy ("http://127.0.0.1:$($port + 1000)") -TimeoutSec 15
         $proxyWatch.Stop()
         $exitIp = $response.Content.Trim()
         if ($exitIp -notmatch '^[0-9a-fA-F:.]+$') { throw 'The proxy responded, but the exit IP could not be identified.' }
@@ -1290,7 +1371,7 @@ function Start-Phone {
         $binding = Get-ProxyBinding $name
         if ($binding) {
             $proxyPort = Start-XrayForAvd $name
-            $proxyMode = "dedicated proxy on port $proxyPort"
+            $proxyMode = "dedicated full VPN tunnel on port $proxyPort"
         } elseif (Test-TcpPort $script:SharedProxyPort) {
             $answer = [Windows.Forms.MessageBox]::Show($script:Form, 'No dedicated proxy is assigned. Start with the shared v2rayN proxy on port 10808?', 'Shared proxy fallback', [Windows.Forms.MessageBoxButtons]::YesNo, [Windows.Forms.MessageBoxIcon]::Warning)
             if ($answer -ne [Windows.Forms.DialogResult]::Yes) { return }
@@ -1336,6 +1417,7 @@ function Stop-Phone {
     if (-not $serial) { Show-Message 'The phone is still booting. Wait a moment and try again.' 'Not ready' ([Windows.Forms.MessageBoxIcon]::Warning); return }
     try {
         Set-Status "Stopping $name safely..."
+        Stop-DeviceTunnel $serial
         & $script:AdbExe -s $serial shell reboot -p 2>$null | Out-Null
         Stop-XrayForAvd $name
         Set-Status "$name stopped."
@@ -1375,32 +1457,23 @@ function Initialize-RunningDevices {
             if ($binding) {
                 $proxyPort = [int]$binding.port
                 if (-not (Test-TcpPort $proxyPort)) { [void](Start-XrayForAvd $name) }
-                $desiredGuestProxy = "10.0.2.2:$proxyPort"
             } elseif (Test-TcpPort $script:SharedProxyPort) {
-                $desiredGuestProxy = "10.0.2.2:$($script:SharedProxyPort)"
+                $proxyPort = $script:SharedProxyPort
             } else {
-                $desiredGuestProxy = ':0'
+                $proxyPort = 0
             }
 
-            $currentGuestProxy = (& $script:AdbExe -s $serial shell settings get global http_proxy 2>$null).Trim()
-            if ($currentGuestProxy -ne $desiredGuestProxy) {
-                foreach ($key in @('global_http_proxy_host', 'global_http_proxy_port', 'global_http_proxy_exclusion_list', 'proxy_pac_url')) {
-                    & $script:AdbExe -s $serial shell settings delete global $key 2>$null | Out-Null
-                }
-                if ($desiredGuestProxy -eq ':0') {
-                    & $script:AdbExe -s $serial shell settings delete global http_proxy 2>$null | Out-Null
-                } else {
-                    & $script:AdbExe -s $serial shell settings put global http_proxy $desiredGuestProxy 2>$null | Out-Null
-                }
-                if ($LASTEXITCODE -ne 0) { throw 'Unable to configure the Android system proxy.' }
-            }
+            Clear-AndroidSystemProxy $serial
+            if ($proxyPort -gt 0) { Ensure-DeviceTunnel $serial $name $proxyPort }
+            else { Stop-DeviceTunnel $serial }
 
             $marker = Join-Path $script:AvdRoot ($name + '.avd\.per_device_proxy_v1')
-            if (Test-Path -LiteralPath $marker) { continue }
-            & $script:AdbExe -s $serial shell cmd media_session volume --stream 3 --set 15 2>$null | Out-Null
-            if ($LASTEXITCODE -ne 0) { & $script:AdbExe -s $serial shell 'for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do input keyevent 24; done' 2>$null | Out-Null }
-            [IO.File]::WriteAllText($marker, (Get-Date).ToString('o'), [Text.UTF8Encoding]::new($false))
-            Set-Status "$name initialized: single Android proxy $desiredGuestProxy active, media volume maximum."
+            if (-not (Test-Path -LiteralPath $marker)) {
+                & $script:AdbExe -s $serial shell cmd media_session volume --stream 3 --set 15 2>$null | Out-Null
+                if ($LASTEXITCODE -ne 0) { & $script:AdbExe -s $serial shell 'for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do input keyevent 24; done' 2>$null | Out-Null }
+                [IO.File]::WriteAllText($marker, (Get-Date).ToString('o'), [Text.UTF8Encoding]::new($false))
+            }
+            if ($proxyPort -gt 0) { Set-Status "$name initialized: full TCP, UDP, and DNS VPN tunnel active on port $proxyPort." }
         }
     } catch {
         if ($_.Exception.Message -notmatch '(?i)error:\s*(closed|offline)|device.*not found') {
@@ -1416,7 +1489,8 @@ if ($SelfTest) {
         @{ Name = 'Emulator'; Path = $script:EmulatorExe },
         @{ Name = 'ADB'; Path = $script:AdbExe },
         @{ Name = 'Template'; Path = (Join-Path $script:AvdRoot ($script:TemplateName + '.avd')) },
-        @{ Name = 'Xray'; Path = (Get-XrayExe) }
+        @{ Name = 'Xray'; Path = (Get-XrayExe) },
+        @{ Name = 'Android VPN component'; Path = $script:TunnelApk }
     )) {
         if ($check.Path -and (Test-Path -LiteralPath $check.Path)) { Write-Output ("PASS $($check.Name): $($check.Path)") } else { $failures.Add("Missing $($check.Name): $($check.Path)") }
     }
