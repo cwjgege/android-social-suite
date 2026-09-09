@@ -1132,7 +1132,7 @@ function Sync-ActionStates {
     $isRunning = $hasSelection -and $script:AvdList.SelectedItems[0].SubItems.Count -gt 1 -and $script:AvdList.SelectedItems[0].SubItems[1].Text -eq 'Running'
     if ($script:StartButton) { $script:StartButton.Enabled = $hasSelection -and -not $isRunning }
     if ($script:StopButton) { $script:StopButton.Enabled = $hasSelection -and $isRunning }
-    foreach ($button in @($script:DeleteButton, $script:SetProxyButton, $script:ClearProxyButton)) {
+    foreach ($button in @($script:DeleteButton, $script:SetProxyButton, $script:ClearProxyButton, $script:ResolutionButton)) {
         if ($button) { $button.Enabled = $hasSelection -and -not $isRunning }
     }
 }
@@ -1282,7 +1282,7 @@ function Prompt-NewPhoneDetails {
     foreach ($profile in $script:DeviceProfiles) { [void]$profileBox.Items.Add($profile) }
     $profileBox.SelectedIndex = 1
 
-    $dialog.ClientSize = [Drawing.Size]::new(490, 348)
+    $dialog.ClientSize = [Drawing.Size]::new(490, 450)
 
     $ramLabel = [Windows.Forms.Label]::new()
     $ramLabel.Text = 'Memory (RAM)'
@@ -1294,7 +1294,7 @@ function Prompt-NewPhoneDetails {
     $ramBox.DropDownStyle = [Windows.Forms.ComboBoxStyle]::DropDownList
     $ramBox.DisplayMember = 'Label'
     foreach ($option in @(
-        [pscustomobject]@{ Label = '2 GB (recommended)'; Value = 2048 },
+        [pscustomobject]@{ Label = '2 GB'; Value = 2048 },
         [pscustomobject]@{ Label = '3 GB'; Value = 3072 },
         [pscustomobject]@{ Label = '4 GB'; Value = 4096 },
         [pscustomobject]@{ Label = '6 GB'; Value = 6144 }
@@ -1309,7 +1309,7 @@ function Prompt-NewPhoneDetails {
     $cpuBox.Location = [Drawing.Point]::new(254, 172)
     $cpuBox.Size = [Drawing.Size]::new(216, 28)
     $cpuBox.DropDownStyle = [Windows.Forms.ComboBoxStyle]::DropDownList
-    foreach ($option in @('2 (recommended)', '4', '6')) { [void]$cpuBox.Items.Add($option) }
+    foreach ($option in @('2', '4', '6')) { [void]$cpuBox.Items.Add($option) }
     $cpuBox.SelectedIndex = 0
 
     $storageLabel = [Windows.Forms.Label]::new()
@@ -1329,17 +1329,39 @@ function Prompt-NewPhoneDetails {
     )) { [void]$storageBox.Items.Add($option) }
     $storageBox.SelectedIndex = 1
 
+    $presetLabel = [Windows.Forms.Label]::new()
+    $presetLabel.Text = 'Performance preset'
+    $presetLabel.Location = [Drawing.Point]::new(20, 278)
+    $presetLabel.AutoSize = $true
+    $presetBox = [Windows.Forms.ComboBox]::new()
+    $presetBox.Location = [Drawing.Point]::new(20, 300)
+    $presetBox.Size = [Drawing.Size]::new(450, 28)
+    $presetBox.DropDownStyle = [Windows.Forms.ComboBoxStyle]::DropDownList
+    [void]$presetBox.Items.Add('Social smooth - 4 GB / 4 cores / 720 x 1560')
+    [void]$presetBox.Items.Add('Custom - selected model resolution')
+    $presetHint = [Windows.Forms.Label]::new()
+    $presetHint.Text = 'Smooth mode reduces sharpness and needs more host RAM.\nExisting phones are unchanged; performance is not guaranteed.'.Replace('\n', "`r`n")
+    $presetHint.Location = [Drawing.Point]::new(20, 337)
+    $presetHint.Size = [Drawing.Size]::new(450, 42)
+    $presetBox.Add_SelectedIndexChanged({
+        $smooth = $presetBox.SelectedIndex -eq 0
+        if ($smooth) { $ramBox.SelectedIndex = 2; $cpuBox.SelectedIndex = 1 }
+        $ramBox.Enabled = -not $smooth
+        $cpuBox.Enabled = -not $smooth
+    })
+    $presetBox.SelectedIndex = 0
+
     $ok = [Windows.Forms.Button]::new()
     $ok.Text = 'Create'
-    $ok.Location = [Drawing.Point]::new(274, 292)
+    $ok.Location = [Drawing.Point]::new(274, 396)
     $ok.Size = [Drawing.Size]::new(94, 34)
     $ok.DialogResult = [Windows.Forms.DialogResult]::OK
     $cancel = [Windows.Forms.Button]::new()
     $cancel.Text = 'Cancel'
-    $cancel.Location = [Drawing.Point]::new(376, 292)
+    $cancel.Location = [Drawing.Point]::new(376, 396)
     $cancel.Size = [Drawing.Size]::new(94, 34)
     $cancel.DialogResult = [Windows.Forms.DialogResult]::Cancel
-    $dialog.Controls.AddRange(@($nameLabel, $nameBox, $profileLabel, $profileBox, $ramLabel, $ramBox, $cpuLabel, $cpuBox, $storageLabel, $storageBox, $ok, $cancel))
+    $dialog.Controls.AddRange(@($nameLabel, $nameBox, $profileLabel, $profileBox, $ramLabel, $ramBox, $cpuLabel, $cpuBox, $storageLabel, $storageBox, $presetLabel, $presetBox, $presetHint, $ok, $cancel))
     $dialog.AcceptButton = $ok
     $dialog.CancelButton = $cancel
 
@@ -1351,6 +1373,7 @@ function Prompt-NewPhoneDetails {
             Ram = [int]$ramBox.SelectedItem.Value
             Cores = [int](([string]$cpuBox.SelectedItem -split ' ')[0])
             Storage = [string]$storageBox.SelectedItem.Value
+            Smooth = $presetBox.SelectedIndex -eq 0
         }
     } else { $null }
     $dialog.Dispose()
@@ -1468,6 +1491,124 @@ function Handle-DroppedFiles {
     }
 }
 
+function Set-PhoneResolution {
+    $name = Get-SelectedAvd
+    if (-not $name -or $name -eq $script:TemplateName) { return }
+    $dialog = $null
+    $temp = $null
+    try {
+        if ((Get-RunningAvds).ContainsKey($name)) { throw 'Stop the phone before changing resolution.' }
+        $dir = Join-Path $script:AvdRoot ($name + '.avd')
+        $path = Join-Path $dir 'config.ini'
+        $config = [IO.File]::ReadAllText($path)
+        $current = @{}
+        foreach ($key in @('hw.lcd.width', 'hw.lcd.height', 'hw.lcd.density')) {
+            if ($config -notmatch ('(?m)^' + [Regex]::Escape($key) + '\s*=\s*(\d+)\s*$')) { throw "Missing display setting: $key" }
+            $current[$key] = [int]$Matches[1]
+            if ($current[$key] -le 0) { throw "Invalid display setting: $key" }
+        }
+        $originalPath = Join-Path $dir 'android-social-display-original.json'
+        if (Test-Path -LiteralPath $originalPath) {
+            $original = [IO.File]::ReadAllText($originalPath) | ConvertFrom-Json
+        } else {
+            $model = $null
+            if ($config -match '(?m)^hw\.device\.name\s*=\s*([^\r\n]+)') {
+                $deviceName = $Matches[1].Trim()
+                $model = $script:DeviceProfiles | Where-Object { $_.DeviceName -eq $deviceName } | Select-Object -First 1
+            }
+            $original = if ($model) { $model } else { [pscustomobject]@{ Width = $current['hw.lcd.width']; Height = $current['hw.lcd.height']; Density = $current['hw.lcd.density'] } }
+        }
+        if ([int]$original.Width -le 0 -or [int]$original.Height -le 0 -or [int]$original.Density -le 0) { throw 'Invalid original display profile.' }
+        $dialog = [Windows.Forms.Form]::new()
+        $dialog.Text = "Resolution - $name"
+        $dialog.StartPosition = 'CenterParent'
+        $dialog.ClientSize = [Drawing.Size]::new(510, 250)
+        $dialog.FormBorderStyle = 'FixedDialog'
+        $dialog.MaximizeBox = $false
+        $dialog.MinimizeBox = $false
+        $label = [Windows.Forms.Label]::new()
+        $label.Text = "Current: $($current['hw.lcd.width']) x $($current['hw.lcd.height']) / $($current['hw.lcd.density']) dpi"
+        $label.Location = [Drawing.Point]::new(20, 20)
+        $label.AutoSize = $true
+        $box = [Windows.Forms.ComboBox]::new()
+        $box.Location = [Drawing.Point]::new(20, 55)
+        $box.Size = [Drawing.Size]::new(470, 28)
+        $box.DropDownStyle = 'DropDownList'
+        $box.DisplayMember = 'Label'
+        foreach ($preset in @(@{Name='Smooth';Edge=720}, @{Name='Balanced';Edge=900}, @{Name='HD';Edge=1080}, @{Name='Original profile';Edge=0})) {
+            $scale = if ($preset.Edge -eq 0) { 1.0 } else { [Math]::Min(1.0, $preset.Edge / [double][Math]::Min($original.Width, $original.Height)) }
+            $w = if ($scale -eq 1.0) { [int]$original.Width } else { [int]([Math]::Round($original.Width * $scale / 2) * 2) }
+            $h = if ($scale -eq 1.0) { [int]$original.Height } else { [int]([Math]::Round($original.Height * $scale / 2) * 2) }
+            $dpi = [Math]::Max(120, [int][Math]::Round($original.Density * $scale))
+            [void]$box.Items.Add([pscustomobject]@{Label="$($preset.Name) - $w x $h ($dpi dpi)";Width=$w;Height=$h;Density=$dpi})
+        }
+        $box.SelectedIndex = 0
+        for ($i=0; $i -lt $box.Items.Count; $i++) {
+            $option = $box.Items[$i]
+            if ($option.Width -eq $current['hw.lcd.width'] -and $option.Height -eq $current['hw.lcd.height'] -and $option.Density -eq $current['hw.lcd.density']) { $box.SelectedIndex=$i; break }
+        }
+        $hint = [Windows.Forms.Label]::new()
+        $hint.Text = 'Lower resolution reduces rendering load and sharpness. Aspect ratio is preserved and density adjusts automatically. Applies on next start. Apps, files, RAM and CPU are unchanged.'
+        $hint.Location = [Drawing.Point]::new(20, 100)
+        $hint.Size = [Drawing.Size]::new(470, 75)
+        $save = [Windows.Forms.Button]::new()
+        $save.Text = 'Save'
+        $save.Location = [Drawing.Point]::new(286, 195)
+        $save.Size = [Drawing.Size]::new(96, 34)
+        $save.DialogResult = 'OK'
+        $cancel = [Windows.Forms.Button]::new()
+        $cancel.Text = 'Cancel'
+        $cancel.Location = [Drawing.Point]::new(394, 195)
+        $cancel.Size = [Drawing.Size]::new(96, 34)
+        $cancel.DialogResult = 'Cancel'
+        $dialog.Controls.AddRange(@($label,$box,$hint,$save,$cancel))
+        $dialog.AcceptButton=$save
+        $dialog.CancelButton=$cancel
+        if ($dialog.ShowDialog($script:Form) -ne [Windows.Forms.DialogResult]::OK) { return }
+        if ((Get-RunningAvds).ContainsKey($name)) { throw 'The phone started while settings were open. Stop it and retry.' }
+        if ([IO.File]::ReadAllText($path) -cne $config) { throw 'Configuration changed. Reopen this dialog before saving.' }
+        $choice=$box.SelectedItem
+        $values=@{'hw.lcd.width'=$choice.Width;'hw.lcd.height'=$choice.Height;'hw.lcd.density'=$choice.Density}
+        foreach ($entry in $values.GetEnumerator()) {
+            $config=$config -replace ('(?m)^'+[Regex]::Escape($entry.Key)+'\s*=.*$'),($entry.Key+' = '+$entry.Value)
+        }
+        if (-not (Test-Path -LiteralPath $originalPath)) {
+            [IO.File]::WriteAllText($originalPath,($original | ConvertTo-Json),[Text.UTF8Encoding]::new($false))
+        }
+        $id=[Guid]::NewGuid().ToString('N')
+        $temp=Join-Path $dir ("resolution-$id.tmp")
+        $backup=Join-Path $dir ("config.ini.before-resolution-$id.bak")
+        [IO.File]::WriteAllText($temp,$config,[Text.UTF8Encoding]::new($false))
+        [IO.File]::Replace($temp,$path,$backup)
+        $temp=$null
+        Set-Status "$name resolution saved: $($choice.Width) x $($choice.Height), $($choice.Density) dpi. Applies on next start; original config backed up."
+    } catch { Show-Message $_.Exception.Message 'Resolution not saved' ([Windows.Forms.MessageBoxIcon]::Warning) }
+    finally {
+        if ($dialog) { $dialog.Dispose() }
+        if ($temp -and (Test-Path -LiteralPath $temp)) { [IO.File]::Delete($temp) }
+    }
+}
+
+function Set-PhonePerformanceConfig {
+    param([string]$Config, $Details)
+    $values = [ordered]@{
+        'hw.ramSize' = $Details.Ram
+        'hw.cpu.ncore' = $Details.Cores
+        'hw.lcd.width' = $(if ($Details.Smooth) { 720 } else { $Details.Profile.Width })
+        'hw.lcd.height' = $(if ($Details.Smooth) { 1560 } else { $Details.Profile.Height })
+        'hw.lcd.density' = $(if ($Details.Smooth) { 300 } else { $Details.Profile.Density })
+        'hw.gpu.enabled' = 'yes'
+        'hw.gpu.mode' = 'host'
+    }
+    foreach ($entry in $values.GetEnumerator()) {
+        $pattern = '(?m)^' + [Regex]::Escape($entry.Key) + '\s*=.*$'
+        $line = $entry.Key + ' = ' + $entry.Value
+        if ($Config -match $pattern) { $Config = $Config -replace $pattern, $line }
+        else { $Config = $Config.TrimEnd() + "`r`n$line`r`n" }
+    }
+    return $Config
+}
+
 function New-Phone {
     $details = Prompt-NewPhoneDetails
     if (-not $details) { return }
@@ -1490,11 +1631,7 @@ function New-Phone {
         $config = $config -replace '(?m)^hw\.keyboard\s*=.*$', 'hw.keyboard = yes'
         $config = $config -replace '(?m)^hw\.device\.manufacturer\s*=.*$', ('hw.device.manufacturer = ' + $profile.Manufacturer)
         $config = $config -replace '(?m)^hw\.device\.name\s*=.*$', ('hw.device.name = ' + $profile.DeviceName)
-        $config = $config -replace '(?m)^hw\.lcd\.width\s*=.*$', ('hw.lcd.width = ' + $profile.Width)
-        $config = $config -replace '(?m)^hw\.lcd\.height\s*=.*$', ('hw.lcd.height = ' + $profile.Height)
-        $config = $config -replace '(?m)^hw\.lcd\.density\s*=.*$', ('hw.lcd.density = ' + $profile.Density)
-        $config = $config -replace '(?m)^hw\.ramSize\s*=.*$', ('hw.ramSize = ' + $details.Ram)
-        $config = $config -replace '(?m)^hw\.cpu\.ncore\s*=.*$', ('hw.cpu.ncore = ' + $details.Cores)
+        $config = Set-PhonePerformanceConfig $config $details
         if ($config -match '(?m)^disk\.dataPartition\.size\s*=') {
             $config = $config -replace '(?m)^disk\.dataPartition\.size\s*=.*$', ('disk.dataPartition.size = ' + $details.Storage)
         } else {
@@ -1505,9 +1642,10 @@ function New-Phone {
             label = $profile.Label
             deviceName = $profile.DeviceName
             manufacturer = $profile.Manufacturer
-            width = $profile.Width
-            height = $profile.Height
-            density = $profile.Density
+            width = $(if ($details.Smooth) { 720 } else { $profile.Width })
+            height = $(if ($details.Smooth) { 1560 } else { $profile.Height })
+            density = $(if ($details.Smooth) { 300 } else { $profile.Density })
+            performancePreset = $(if ($details.Smooth) { 'social-smooth' } else { 'custom' })
             ramMb = $details.Ram
             cpuCores = $details.Cores
             storage = $details.Storage
@@ -1800,7 +1938,7 @@ $script:Form = [Windows.Forms.Form]::new()
 $script:Form.Text = 'Android Social Suite'
 $script:Form.StartPosition = 'CenterScreen'
 $script:Form.ClientSize = [Drawing.Size]::new(1180, 760)
-$script:Form.MinimumSize = [Drawing.Size]::new(1120, 720)
+$script:Form.MinimumSize = [Drawing.Size]::new(1200, 720)
 $script:Form.BackColor = [Drawing.Color]::FromArgb(250, 249, 247)
 $script:Form.Font = [Drawing.Font]::new('Segoe UI', 9)
 $script:Form.AllowDrop = $false
@@ -1855,7 +1993,8 @@ $buttonSpecs = @(
     @{ Text = 'Set Proxy'; X = 518; W = 126; Action = { Set-VlessForPhone }; Kind = 'Neutral' },
     @{ Text = 'Clear Proxy'; X = 656; W = 126; Action = { Clear-VlessForPhone }; Kind = 'Neutral' },
     @{ Text = 'Test All'; X = 794; W = 116; Action = { Test-PhoneProxy }; Kind = 'Accent' },
-    @{ Text = 'Refresh'; X = 922; W = 108; Action = { Update-AvdList }; Kind = 'Neutral' }
+    @{ Text = 'Refresh'; X = 922; W = 108; Action = { Update-AvdList }; Kind = 'Neutral' },
+    @{ Text = 'Resolution'; X = 1042; W = 114; Action = { Set-PhoneResolution }; Kind = 'Neutral' }
 )
 foreach ($spec in $buttonSpecs) {
     $button = [Windows.Forms.Button]::new()
@@ -1902,6 +2041,7 @@ foreach ($spec in $buttonSpecs) {
         'Delete' { $script:DeleteButton = $button }
         'Set Proxy' { $script:SetProxyButton = $button }
         'Clear Proxy' { $script:ClearProxyButton = $button }
+        'Resolution' { $script:ResolutionButton = $button }
     }
 }
 
