@@ -120,10 +120,13 @@ $script:SdkRoot = Join-Path $script:BaseRoot 'android-sdk'
 $script:EmulatorHome = Join-Path $script:BaseRoot 'emulator-home'
 $script:EmulatorExe = Join-Path $script:SdkRoot 'emulator\emulator.exe'
 $script:AdbExe = Join-Path $script:SdkRoot 'platform-tools\adb.exe'
-$script:TunnelApk = Join-Path $PSScriptRoot 'android-social-tunnel.apk'
+$script:TunnelApk = @(
+    (Join-Path $PSScriptRoot 'vendor\android-vpn\android-social-tunnel.apk'),
+    (Join-Path $PSScriptRoot 'android-social-tunnel.apk')
+) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 $script:TunnelPackage = 'com.android.socialsuite.vpn'
 $script:TunnelReceiver = 'com.android.socialsuite.vpn/.TunnelControlReceiver'
-$script:TunnelVersionCode = 13
+$script:TunnelVersionCode = 15
 $script:AdbKey = Join-Path $env:USERPROFILE '.android\adbkey'
 $script:TemplateName = 'social_template'
 $script:SharedProxyPort = 10808
@@ -638,7 +641,10 @@ function New-UniversalProxyConfigObject {
         if ($outbound.protocol -notin @('vless', 'vmess', 'trojan', 'shadowsocks', 'socks', 'http', 'wireguard', 'hysteria')) { throw "Unsupported Xray outbound protocol: $($outbound.protocol)" }
         return New-ProxyEnvelope $outbound $Port
     }
-    if ($value -match '^vless://') { return New-XrayConfigObject $value $Port }
+    if ($value -match '^vless://') {
+        $vlessConfig = New-XrayConfigObject $value $Port
+        return New-ProxyEnvelope $vlessConfig.outbounds[0] $Port
+    }
 
     if ($value -match '^vmess://') {
         $payload = $value.Substring(8).Split('#')[0]
@@ -857,16 +863,13 @@ function Ensure-DeviceTunnel {
     }
 
     $packageInfo = (& $script:AdbExe -s $Serial shell dumpsys package $script:TunnelPackage 2>$null | Out-String)
-    $expectedVersion = "versionCode=$($script:TunnelVersionCode)"
-    if ($packageInfo -notmatch [Regex]::Escape($expectedVersion)) {
+    $installedVersion = 0
+    if ($packageInfo -match '\bversionCode=(\d+)\b') { $installedVersion = [int]$Matches[1] }
+    if ($installedVersion -lt $script:TunnelVersionCode) {
         Set-Status "Installing the managed VPN component on $Name..."
         $installOutput = (& $script:AdbExe -s $Serial install -r -g $script:TunnelApk 2>&1 | Out-String)
         if ($LASTEXITCODE -ne 0 -or $installOutput -notmatch 'Success') {
-            & $script:AdbExe -s $Serial uninstall $script:TunnelPackage 2>$null | Out-Null
-            $installOutput = (& $script:AdbExe -s $Serial install -g $script:TunnelApk 2>&1 | Out-String)
-        }
-        if ($LASTEXITCODE -ne 0 -or $installOutput -notmatch 'Success') {
-            throw "Unable to install the managed VPN component: $($installOutput.Trim())"
+            throw "VPN upgrade failed; existing component preserved: $($installOutput.Trim())"
         }
     }
 
@@ -879,12 +882,13 @@ function Ensure-DeviceTunnel {
         if ($LASTEXITCODE -ne 0) { throw 'Unable to create the private ADB tunnel to Xray.' }
     }
     $currentStatus = Invoke-DeviceTunnelControl $Serial STATUS
-    if ($currentStatus -match 'running=true') { return }
+    $endpointPattern = 'running=true;host=127\.0\.0\.1;port=' + $Port + ';'
+    if ($currentStatus -match $endpointPattern) { return }
     $connectOutput = Invoke-DeviceTunnelControl $Serial CONNECT $Port
     if ($connectOutput -notmatch 'accepted=true') { throw "Unable to start the Android VPN service: $connectOutput" }
     Start-Sleep -Milliseconds 900
     $statusOutput = Invoke-DeviceTunnelControl $Serial STATUS
-    if ($statusOutput -notmatch 'running=true') { throw "The Android VPN service did not become ready: $statusOutput" }
+    if ($statusOutput -notmatch $endpointPattern) { throw "The Android VPN endpoint did not become ready: $statusOutput" }
 }
 
 function Stop-DeviceTunnel {
@@ -1236,14 +1240,13 @@ function Test-PhoneProxy {
         if ($exitIp -notmatch '^[0-9a-fA-F:.]+$') { throw 'The proxy responded, but the exit IP could not be identified.' }
         $tcpText = if ($null -ne $tcpLatency) { "$tcpLatency ms" } else { 'N/A (endpoint unavailable or timed out)' }
         $proxyLatency = [Math]::Round($proxyWatch.Elapsed.TotalMilliseconds)
-        Set-PhoneLatencyResult $name "TCP $tcpText / HTTPS $proxyLatency ms"
-        Set-Status "${name}: TCP $tcpText, HTTPS $proxyLatency ms, exit $exitIp"
+        Set-PhoneLatencyResult $name "Host TCP $tcpText / HTTPS $proxyLatency ms"
+        Set-Status "${name}: host proxy OK, exit $exitIp. Android connectivity and bandwidth not tested."
     } catch {
         $reason = $_.Exception.Message
         if ($reason.Length -gt 42) { $reason = $reason.Substring(0, 39) + '...' }
         Set-PhoneLatencyResult $name "Failed: $reason"
         Set-Status "$name latency test failed: $($_.Exception.Message)"
-        Set-Status "$name proxy test failed."
     } finally {
         if (-not $wasRunning -and -not (Get-RunningAvds).ContainsKey($name)) { Stop-XrayForAvd $name }
     }
@@ -1658,11 +1661,11 @@ function Initialize-RunningDevices {
                 if ($LASTEXITCODE -ne 0) { & $script:AdbExe -s $serial shell 'for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do input keyevent 24; done' 2>$null | Out-Null }
                 [IO.File]::WriteAllText($marker, (Get-Date).ToString('o'), [Text.UTF8Encoding]::new($false))
             }
-            if ($proxyPort -gt 0) { Set-Status "$name initialized: full TCP, UDP, and DNS VPN tunnel active on port $proxyPort." }
+            if ($proxyPort -gt 0) { Set-Status "$name VPN endpoint ready on port $proxyPort; Internet access not yet verified." }
         }
     } catch {
         if ($_.Exception.Message -notmatch '(?i)error:\s*(closed|offline)|device.*not found') {
-            Set-Status 'Device initialization will retry after the connection stabilizes.'
+            Set-Status "Device initialization failed: $($_.Exception.Message)"
         }
     } finally { $script:InitializingDevices = $false }
 }
@@ -1686,7 +1689,20 @@ if ($Maintenance) {
 
 function Update-BackgroundMaintenance {
     if ($script:MaintenanceProcess) {
-        if (-not $script:MaintenanceProcess.HasExited) { return }
+        if (-not $script:MaintenanceProcess.HasExited) {
+            if (([DateTime]::UtcNow - $script:MaintenanceStartedAt).TotalSeconds -lt $script:MaintenanceTimeoutSeconds) { return }
+            try {
+                $script:MaintenanceProcess.Kill()
+                Set-Status 'Background task timed out; retrying shortly. Network state is unverified.'
+            } catch {
+                Set-Status "Unable to stop timed-out background task: $($_.Exception.Message)"
+                return
+            }
+            $script:MaintenanceProcess.Dispose()
+            $script:MaintenanceProcess = $null
+            $script:NextMaintenance = [DateTime]::UtcNow.AddSeconds(15)
+            return
+        }
         try {
             if ($script:MaintenanceProcess.ExitCode -eq 0 -and (Test-Path -LiteralPath $script:SnapshotFile)) {
                 $snapshot = [IO.File]::ReadAllText($script:SnapshotFile) | ConvertFrom-Json
@@ -1698,7 +1714,9 @@ function Update-BackgroundMaintenance {
                 Sync-ActionStates
                 Sync-EmulatorWindowPlacement
                 if ($snapshot.status) { Set-Status $snapshot.status }
-            }
+            } else { Set-Status 'Background task failed; network state is unverified. Retrying shortly.' }
+        } catch {
+            Set-Status "Unable to load background results: $($_.Exception.Message)"
         } finally {
             $script:MaintenanceProcess.Dispose()
             $script:MaintenanceProcess = $null
@@ -1708,6 +1726,8 @@ function Update-BackgroundMaintenance {
     if ([DateTime]::UtcNow -lt $script:NextMaintenance -and -not $script:LatencyPending) { return }
     $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Maintenance -SnapshotPath "{1}"' -f $PSCommandPath, $script:SnapshotFile
     if ($script:LatencyPending) { $arguments += ' -MeasureLatency' }
+    $script:MaintenanceTimeoutSeconds = if ($script:LatencyPending) { [Math]::Max(90, 45 * @(Get-AvdNames).Count) } else { 60 }
+    $script:MaintenanceStartedAt = [DateTime]::UtcNow
     $script:MaintenanceProcess = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -ArgumentList $arguments -WindowStyle Hidden -PassThru
     $script:LatencyPending = $false
 }
@@ -1734,6 +1754,9 @@ if ($SelfTest) {
         try {
             $sample = 'vless://11111111-1111-4111-8111-111111111111@example.com:443?encryption=none&security=tls&sni=example.com&type=ws&host=example.com&path=%2Fws#selftest'
             Test-XrayConfig (New-XrayConfigJson $sample 18999)
+            $sampleConfig = New-XrayConfigJson $sample 18999 | ConvertFrom-Json
+            if (-not @($sampleConfig.inbounds | Where-Object { $_.protocol -eq 'socks' -and $_.port -eq 18999 -and $_.settings.udp }).Count) { throw 'VLESS SOCKS5/UDP listener is missing.' }
+            if (-not @($sampleConfig.inbounds | Where-Object { $_.protocol -eq 'http' -and $_.port -eq 19999 }).Count) { throw 'VLESS HTTP test listener is missing.' }
             Write-Output 'PASS generated VLESS/Xray configuration'
         } catch { $failures.Add('Generated Xray configuration failed: ' + $_.Exception.Message) }
     }

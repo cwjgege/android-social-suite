@@ -11,6 +11,11 @@ $resolvedBuild = [IO.Path]::GetFullPath($buildRoot)
 if (-not $resolvedBuild.StartsWith($expectedPrefix, [StringComparison]::OrdinalIgnoreCase)) {
     throw 'Unsafe VPN build directory.'
 }
+$keystore = Join-Path $project 'android-social-tunnel.jks'
+$previousKeystore = Join-Path $buildRoot 'android-social-tunnel.jks'
+if (-not (Test-Path -LiteralPath $keystore) -and (Test-Path -LiteralPath $previousKeystore)) {
+    Copy-Item -LiteralPath $previousKeystore -Destination $keystore
+}
 if (Test-Path -LiteralPath $buildRoot) { Remove-Item -LiteralPath $buildRoot -Recurse -Force }
 
 $javaHome = Join-Path $root 'android-jdk\jdk-17.0.20.1+1'
@@ -35,7 +40,6 @@ foreach ($path in @($androidJar, $aapt2, $d8, $zipalign, $apksigner, $javac, $ja
 $classes = Join-Path $buildRoot 'classes'
 $dex = Join-Path $buildRoot 'dex'
 $staging = Join-Path $buildRoot 'staging'
-$keystore = Join-Path $buildRoot 'android-social-tunnel.jks'
 New-Item -ItemType Directory -Force -Path $classes, $dex, (Join-Path $staging 'lib\x86_64') | Out-Null
 
 $unsigned = Join-Path $buildRoot 'base-unsigned.apk'
@@ -60,8 +64,10 @@ if ($LASTEXITCODE -ne 0) { throw 'APK assembly failed.' }
 
 & $zipalign -f 4 $withFiles $aligned
 if ($LASTEXITCODE -ne 0) { throw 'zipalign failed.' }
-& $keytool -genkeypair -noprompt -keystore $keystore -storetype JKS -storepass androidsocialsuite -keypass androidsocialsuite -alias androidsocialsuite -keyalg RSA -keysize 2048 -validity 36500 -dname 'CN=Android Social Suite, O=Android Social Suite, C=US'
-if ($LASTEXITCODE -ne 0) { throw 'Signing key creation failed.' }
+if (-not (Test-Path -LiteralPath $keystore)) {
+    & $keytool -genkeypair -noprompt -keystore $keystore -storetype JKS -storepass androidsocialsuite -keypass androidsocialsuite -alias androidsocialsuite -keyalg RSA -keysize 2048 -validity 36500 -dname 'CN=Android Social Suite, O=Android Social Suite, C=US'
+    if ($LASTEXITCODE -ne 0) { throw 'Signing key creation failed.' }
+}
 & $apksigner sign --ks $keystore --ks-key-alias androidsocialsuite --ks-pass pass:androidsocialsuite --key-pass pass:androidsocialsuite --out $output $aligned
 if ($LASTEXITCODE -ne 0) { throw 'APK signing failed.' }
 & $apksigner verify --verbose $output

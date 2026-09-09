@@ -22,6 +22,8 @@ public final class TunnelControlReceiver extends BroadcastReceiver {
             error = error.replace(';', ',').replace('\r', ' ').replace('\n', ' ');
             setResultCode(Activity.RESULT_OK);
             setResultData("running=" + running
+                    + ";host=" + ManagedTunnelService.getCurrentHost()
+                    + ";port=" + ManagedTunnelService.getCurrentPort()
                     + ";txPackets=" + stats[0]
                     + ";txBytes=" + stats[1]
                     + ";rxPackets=" + stats[2]

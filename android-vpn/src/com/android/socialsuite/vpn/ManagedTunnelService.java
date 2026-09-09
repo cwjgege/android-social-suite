@@ -27,8 +27,8 @@ public final class ManagedTunnelService extends VpnService {
     private static volatile boolean nativeRunning;
     private static volatile String lastError = "";
     private ParcelFileDescriptor tunnel;
-    private String currentHost;
-    private int currentPort;
+    private static volatile String currentHost;
+    private static volatile int currentPort;
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
@@ -40,11 +40,13 @@ public final class ManagedTunnelService extends VpnService {
         }
 
         SharedPreferences preferences = getSharedPreferences("managed", MODE_PRIVATE);
-        String host = intent == null ? preferences.getString("host", "10.0.2.2")
+        boolean explicitEndpoint = intent != null && ACTION_CONNECT.equals(action);
+        String host = !explicitEndpoint ? preferences.getString("host", "127.0.0.1")
                 : intent.getStringExtra("socks_host");
-        int port = intent == null ? preferences.getInt("port", 0)
+        int port = !explicitEndpoint ? preferences.getInt("port", 0)
                 : intent.getIntExtra("socks_port", 0);
         if (host == null || !host.matches("[A-Za-z0-9.:_-]+") || port < 1 || port > 65535) {
+            lastError = "Invalid SOCKS endpoint";
             stopSelf();
             return START_NOT_STICKY;
         }
@@ -106,7 +108,7 @@ public final class ManagedTunnelService extends VpnService {
                 + "  address: '" + host + "'\n"
                 + "  port: " + port + "\n"
                 + "  udp: 'udp'\n"
-                + "  udp-address: '" + host + "'\n"
+                + "  udp-address: '" + ("127.0.0.1".equals(host) ? "10.0.2.2" : host) + "'\n"
                 + "mapdns:\n"
                 + "  address: 198.18.0.2\n"
                 + "  port: 53\n"
@@ -145,6 +147,14 @@ public final class ManagedTunnelService extends VpnService {
 
     public static boolean isTunnelRunning() {
         return nativeRunning;
+    }
+
+    public static String getCurrentHost() {
+        return currentHost == null ? "" : currentHost;
+    }
+
+    public static int getCurrentPort() {
+        return currentPort;
     }
 
     public static String getLastError() {
