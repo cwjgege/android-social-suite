@@ -1,6 +1,9 @@
 param(
     [switch]$SelfTest,
-    [string]$CapturePreview
+    [string]$CapturePreview,
+    [switch]$Maintenance,
+    [string]$SnapshotPath,
+    [switch]$MeasureLatency
 )
 
 $ErrorActionPreference = 'Stop'
@@ -18,6 +21,32 @@ using System.Runtime.InteropServices;
 using System.Text;
 
 public static class EmulatorWindowNative {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+    [DllImport("kernel32.dll")]
+    private static extern bool CloseHandle(IntPtr handle);
+    [DllImport("ntdll.dll")]
+    private static extern int NtQueryInformationProcess(IntPtr handle, int info, IntPtr buffer, int size, out int needed);
+
+    public static string ReadCommandLine(int pid) {
+        IntPtr handle = OpenProcess(0x1000, false, pid);
+        if (handle == IntPtr.Zero) return null;
+        IntPtr buffer = IntPtr.Zero;
+        try {
+            int needed;
+            NtQueryInformationProcess(handle, 60, IntPtr.Zero, 0, out needed);
+            if (needed <= 0) return null;
+            buffer = Marshal.AllocHGlobal(needed);
+            if (NtQueryInformationProcess(handle, 60, buffer, needed, out needed) != 0) return null;
+            int length = (ushort)Marshal.ReadInt16(buffer);
+            IntPtr text = Marshal.ReadIntPtr(buffer, IntPtr.Size == 8 ? 8 : 4);
+            return Marshal.PtrToStringUni(text, length / 2);
+        } finally {
+            if (buffer != IntPtr.Zero) Marshal.FreeHGlobal(buffer);
+            CloseHandle(handle);
+        }
+    }
+
     public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
     [StructLayout(LayoutKind.Sequential)]
@@ -150,7 +179,6 @@ function Set-Status {
     param([string]$Text)
     if ($script:StatusLabel) {
         $script:StatusLabel.Text = $Text
-        [System.Windows.Forms.Application]::DoEvents()
     }
 }
 
@@ -176,19 +204,54 @@ function Get-AvdNames {
         Sort-Object)
 }
 
+function Get-AvdProcesses {
+    param([string]$Name)
+    foreach ($process in @(Get-Process -Name 'qemu-system-x86_64', 'emulator' -ErrorAction SilentlyContinue)) {
+        $commandLine = [EmulatorWindowNative]::ReadCommandLine($process.Id)
+        if (-not $commandLine) {
+            if (-not $process.HasExited) { throw 'Cannot identify an emulator process. Close its window or retry with the same Windows user.' }
+            continue
+        }
+        if ($commandLine -match '(?:^|\s)-avd\s+"?([^"\s]+)') {
+            $deviceName = $Matches[1]
+            if (-not $Name -or $deviceName -eq $Name) {
+                [pscustomobject]@{ Name = $deviceName; Process = $process }
+            }
+        }
+    }
+}
+
 function Get-RunningAvds {
+    param([switch]$Cached)
+    if ($Cached -and $script:Form -and -not $Maintenance) { return $script:RunningSnapshot }
     $running = @{}
     try {
-        foreach ($process in Get-CimInstance Win32_Process -Filter "Name='qemu-system-x86_64.exe'" -ErrorAction Stop) {
-            if ($process.CommandLine -match '(?:^|\s)-avd\s+"?([^"\s]+)') {
-                $running[$Matches[1]] = $true
-            }
+        foreach ($entry in Get-AvdProcesses) {
+            $running[$entry.Name] = $true
         }
     } catch {
         foreach ($name in Get-AvdNames) {
             $avdDirectory = Join-Path $script:AvdRoot ($name + '.avd')
-            if (Get-ChildItem -LiteralPath $avdDirectory -Filter '*.lock' -ErrorAction SilentlyContinue) {
+            if ([EmulatorWindowNative]::FindEmulator($name) -ne [IntPtr]::Zero) {
                 $running[$name] = $true
+                continue
+            }
+            # Lock files can survive shutdown. Check live file ownership instead.
+            $files = @(Get-ChildItem -LiteralPath $avdDirectory -File -ErrorAction Stop | Where-Object {
+                $_.Name -like '*.lock' -or $_.Name -like 'userdata-qemu.img*' -or
+                $_.Name -like 'cache.img*' -or $_.Name -eq 'sdcard.img'
+            })
+            foreach ($file in $files) {
+                $probe = $null
+                try {
+                    $probe = [IO.File]::Open($file.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+                } catch [IO.IOException] {
+                    $code = $_.Exception.HResult -band 0xffff
+                    if ($code -in @(32, 33)) { $running[$name] = $true; break }
+                    if ($code -notin @(2, 3)) { throw }
+                } finally {
+                    if ($probe) { $probe.Dispose() }
+                }
             }
         }
     }
@@ -218,7 +281,7 @@ function Set-EmulatorWindowSafePosition {
 }
 
 function Sync-EmulatorWindowPlacement {
-    $running = Get-RunningAvds
+    $running = Get-RunningAvds -Cached
     foreach ($name in @($script:PlacedEmulatorWindows)) {
         if (-not $running.ContainsKey($name)) { [void]$script:PlacedEmulatorWindows.Remove($name) }
     }
@@ -674,9 +737,12 @@ function Get-XrayProcessForAvd {
     param([string]$Name)
     $configPath = Get-XrayConfigPath $Name
     try {
-        @(Get-CimInstance Win32_Process -Filter "Name='xray.exe'" -ErrorAction Stop |
-            Where-Object { $_.CommandLine -and $_.CommandLine.IndexOf($configPath, [StringComparison]::OrdinalIgnoreCase) -ge 0 }) |
-            Select-Object -First 1
+        foreach ($process in @(Get-Process -Name xray -ErrorAction SilentlyContinue)) {
+            $commandLine = [EmulatorWindowNative]::ReadCommandLine($process.Id)
+            if ($commandLine -and $commandLine.IndexOf(('"' + $configPath + '"'), [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                return [pscustomobject]@{ ProcessId = $process.Id }
+            }
+        }
     } catch { $null }
 }
 
@@ -700,13 +766,37 @@ function Start-XrayForAvd {
     if (-not $binding) { return $null }
     $port = [int]$binding.port
     $owned = Get-XrayProcessForAvd $Name
-    if ($owned -and (Test-TcpPort $port)) { return $port }
+    $configJson = $null
+    if ($owned -and (Test-TcpPort $port)) {
+        $activeConfig = [IO.File]::ReadAllText((Get-XrayConfigPath $Name)) | ConvertFrom-Json
+        $socks = @($activeConfig.inbounds | Where-Object { $_.protocol -eq 'socks' -and $_.port -eq $port })
+        if ($socks.Count -gt 0) { return $port }
+        $legacy = @($activeConfig.inbounds | Where-Object { $_.protocol -eq 'http' -and $_.port -eq $port })
+        if ($legacy.Count -ne 1) { throw 'The active proxy configuration needs to be saved again with Set Proxy.' }
+        $legacy[0].port = $port + 1000
+        $legacyTag = [string]$legacy[0].tag
+        $activeConfig.inbounds = @($activeConfig.inbounds) + @([pscustomobject]@{
+            tag = 'android-vpn-socks'; listen = '127.0.0.1'; port = $port; protocol = 'socks'
+            settings = @{ auth = 'noauth'; udp = $true; ip = '127.0.0.1' }
+        })
+        foreach ($rule in $activeConfig.routing.rules) {
+            if ($rule.inboundTag -and $legacyTag -in $rule.inboundTag) {
+                $rule.inboundTag = @($rule.inboundTag) + @('android-vpn-socks')
+            }
+        }
+        $configJson = ConvertTo-Json -InputObject $activeConfig -Depth 24
+        Test-XrayConfig $configJson
+        Stop-Process -Id $owned.ProcessId -Force -ErrorAction Stop
+        Start-Sleep -Milliseconds 200
+    }
     if (Test-TcpPort $port) { throw "Local port $port is occupied by another program." }
 
     $xray = Get-XrayExe
     if (-not $xray) { throw 'Xray core is missing. Reopen AndroidSocialSuite.exe to install it.' }
-    $vlessUri = Unprotect-Secret $binding.encryptedUri
-    $configJson = New-XrayConfigJson $vlessUri $port
+    if (-not $configJson) {
+        $vlessUri = Unprotect-Secret $binding.encryptedUri
+        $configJson = New-XrayConfigJson $vlessUri $port
+    }
     $configPath = Get-XrayConfigPath $Name
     $configDirectory = Split-Path $configPath -Parent
     [void](New-Item -ItemType Directory -Path $configDirectory -Force)
@@ -783,9 +873,13 @@ function Ensure-DeviceTunnel {
     & $script:AdbExe -s $Serial shell appops set $script:TunnelPackage ACTIVATE_VPN allow 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Unable to authorize the Android VPN service.' }
     Clear-AndroidSystemProxy $Serial
-    & $script:AdbExe -s $Serial reverse --remove-all 2>$null | Out-Null
-    & $script:AdbExe -s $Serial reverse "tcp:$Port" "tcp:$Port" 2>$null | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw 'Unable to create the private ADB tunnel to Xray.' }
+    $reverseList = (& $script:AdbExe -s $Serial reverse --list 2>$null | Out-String)
+    if ($reverseList -notmatch ('(?m)\btcp:' + $Port + '\s+tcp:' + $Port + '\s*$')) {
+        & $script:AdbExe -s $Serial reverse "tcp:$Port" "tcp:$Port" 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'Unable to create the private ADB tunnel to Xray.' }
+    }
+    $currentStatus = Invoke-DeviceTunnelControl $Serial STATUS
+    if ($currentStatus -match 'running=true') { return }
     $connectOutput = Invoke-DeviceTunnelControl $Serial CONNECT $Port
     if ($connectOutput -notmatch 'accepted=true') { throw "Unable to start the Android VPN service: $connectOutput" }
     Start-Sleep -Milliseconds 900
@@ -822,7 +916,7 @@ function Get-DeviceProfileLabel {
 
 function Update-AvdList {
     $selectedName = if ($script:AvdList.SelectedItems.Count -gt 0) { $script:AvdList.SelectedItems[0].Text } else { $null }
-    $running = Get-RunningAvds
+    $running = Get-RunningAvds -Cached
     $bindings = @{}
     foreach ($binding in Get-ProxyBindings) { $bindings[$binding.avdName] = $binding }
     $rows = [Collections.Generic.List[object]]::new()
@@ -1053,6 +1147,12 @@ function Test-AllPhoneProxies {
     $names = @($list.Items | ForEach-Object { $_.Text } | Where-Object { $_ -and $_ -ne $script:TemplateName })
     if ($names.Count -eq 0) { return }
 
+    if ($script:Form -and -not $Maintenance) {
+        $script:LatencyPending = $true
+        Set-Status 'Latency test queued. Results will appear in the device cards.'
+        return
+    }
+
     $mode = if ($Automatic) { 'Automatic' } else { 'Manual' }
     Set-Status "$mode latency test started for $($names.Count) phone(s)..."
     foreach ($phoneName in $names) {
@@ -1179,23 +1279,76 @@ function Prompt-NewPhoneDetails {
     foreach ($profile in $script:DeviceProfiles) { [void]$profileBox.Items.Add($profile) }
     $profileBox.SelectedIndex = 1
 
+    $dialog.ClientSize = [Drawing.Size]::new(490, 348)
+
+    $ramLabel = [Windows.Forms.Label]::new()
+    $ramLabel.Text = 'Memory (RAM)'
+    $ramLabel.Location = [Drawing.Point]::new(20, 148)
+    $ramLabel.AutoSize = $true
+    $ramBox = [Windows.Forms.ComboBox]::new()
+    $ramBox.Location = [Drawing.Point]::new(20, 172)
+    $ramBox.Size = [Drawing.Size]::new(216, 28)
+    $ramBox.DropDownStyle = [Windows.Forms.ComboBoxStyle]::DropDownList
+    $ramBox.DisplayMember = 'Label'
+    foreach ($option in @(
+        [pscustomobject]@{ Label = '2 GB (recommended)'; Value = 2048 },
+        [pscustomobject]@{ Label = '3 GB'; Value = 3072 },
+        [pscustomobject]@{ Label = '4 GB'; Value = 4096 },
+        [pscustomobject]@{ Label = '6 GB'; Value = 6144 }
+    )) { [void]$ramBox.Items.Add($option) }
+    $ramBox.SelectedIndex = 0
+
+    $cpuLabel = [Windows.Forms.Label]::new()
+    $cpuLabel.Text = 'CPU cores'
+    $cpuLabel.Location = [Drawing.Point]::new(254, 148)
+    $cpuLabel.AutoSize = $true
+    $cpuBox = [Windows.Forms.ComboBox]::new()
+    $cpuBox.Location = [Drawing.Point]::new(254, 172)
+    $cpuBox.Size = [Drawing.Size]::new(216, 28)
+    $cpuBox.DropDownStyle = [Windows.Forms.ComboBoxStyle]::DropDownList
+    foreach ($option in @('2 (recommended)', '4', '6')) { [void]$cpuBox.Items.Add($option) }
+    $cpuBox.SelectedIndex = 0
+
+    $storageLabel = [Windows.Forms.Label]::new()
+    $storageLabel.Text = 'Phone storage'
+    $storageLabel.Location = [Drawing.Point]::new(20, 212)
+    $storageLabel.AutoSize = $true
+    $storageBox = [Windows.Forms.ComboBox]::new()
+    $storageBox.Location = [Drawing.Point]::new(20, 236)
+    $storageBox.Size = [Drawing.Size]::new(450, 28)
+    $storageBox.DropDownStyle = [Windows.Forms.ComboBoxStyle]::DropDownList
+    $storageBox.DisplayMember = 'Label'
+    foreach ($option in @(
+        [pscustomobject]@{ Label = '16 GB'; Value = '16G' },
+        [pscustomobject]@{ Label = '32 GB (recommended)'; Value = '32G' },
+        [pscustomobject]@{ Label = '64 GB'; Value = '64G' },
+        [pscustomobject]@{ Label = '128 GB'; Value = '128G' }
+    )) { [void]$storageBox.Items.Add($option) }
+    $storageBox.SelectedIndex = 1
+
     $ok = [Windows.Forms.Button]::new()
     $ok.Text = 'Create'
-    $ok.Location = [Drawing.Point]::new(274, 174)
+    $ok.Location = [Drawing.Point]::new(274, 292)
     $ok.Size = [Drawing.Size]::new(94, 34)
     $ok.DialogResult = [Windows.Forms.DialogResult]::OK
     $cancel = [Windows.Forms.Button]::new()
     $cancel.Text = 'Cancel'
-    $cancel.Location = [Drawing.Point]::new(376, 174)
+    $cancel.Location = [Drawing.Point]::new(376, 292)
     $cancel.Size = [Drawing.Size]::new(94, 34)
     $cancel.DialogResult = [Windows.Forms.DialogResult]::Cancel
-    $dialog.Controls.AddRange(@($nameLabel, $nameBox, $profileLabel, $profileBox, $ok, $cancel))
+    $dialog.Controls.AddRange(@($nameLabel, $nameBox, $profileLabel, $profileBox, $ramLabel, $ramBox, $cpuLabel, $cpuBox, $storageLabel, $storageBox, $ok, $cancel))
     $dialog.AcceptButton = $ok
     $dialog.CancelButton = $cancel
 
     $result = $dialog.ShowDialog($script:Form)
     $details = if ($result -eq [Windows.Forms.DialogResult]::OK) {
-        [pscustomobject]@{ Name = $nameBox.Text.Trim(); Profile = $profileBox.SelectedItem }
+        [pscustomobject]@{
+            Name = $nameBox.Text.Trim()
+            Profile = $profileBox.SelectedItem
+            Ram = [int]$ramBox.SelectedItem.Value
+            Cores = [int](([string]$cpuBox.SelectedItem -split ' ')[0])
+            Storage = [string]$storageBox.SelectedItem.Value
+        }
     } else { $null }
     $dialog.Dispose()
     $details
@@ -1337,8 +1490,13 @@ function New-Phone {
         $config = $config -replace '(?m)^hw\.lcd\.width\s*=.*$', ('hw.lcd.width = ' + $profile.Width)
         $config = $config -replace '(?m)^hw\.lcd\.height\s*=.*$', ('hw.lcd.height = ' + $profile.Height)
         $config = $config -replace '(?m)^hw\.lcd\.density\s*=.*$', ('hw.lcd.density = ' + $profile.Density)
-        $config = $config -replace '(?m)^hw\.ramSize\s*=.*$', ('hw.ramSize = ' + $profile.Ram)
-        $config = $config -replace '(?m)^hw\.cpu\.ncore\s*=.*$', ('hw.cpu.ncore = ' + $profile.Cores)
+        $config = $config -replace '(?m)^hw\.ramSize\s*=.*$', ('hw.ramSize = ' + $details.Ram)
+        $config = $config -replace '(?m)^hw\.cpu\.ncore\s*=.*$', ('hw.cpu.ncore = ' + $details.Cores)
+        if ($config -match '(?m)^disk\.dataPartition\.size\s*=') {
+            $config = $config -replace '(?m)^disk\.dataPartition\.size\s*=.*$', ('disk.dataPartition.size = ' + $details.Storage)
+        } else {
+            $config = $config.TrimEnd() + "`r`ndisk.dataPartition.size = $($details.Storage)`r`n"
+        }
         [IO.File]::WriteAllText((Join-Path $destination 'config.ini'), $config, [Text.UTF8Encoding]::new($false))
         $profileRecord = [ordered]@{
             label = $profile.Label
@@ -1347,6 +1505,9 @@ function New-Phone {
             width = $profile.Width
             height = $profile.Height
             density = $profile.Density
+            ramMb = $details.Ram
+            cpuCores = $details.Cores
+            storage = $details.Storage
             createdAt = (Get-Date).ToString('o')
         } | ConvertTo-Json
         [IO.File]::WriteAllText((Join-Path $destination 'android-social-profile.json'), $profileRecord, [Text.UTF8Encoding]::new($false))
@@ -1412,9 +1573,33 @@ function Get-DeviceForAvd {
 function Stop-Phone {
     $name = Get-SelectedAvd
     if (-not $name -or $name -eq $script:TemplateName) { return }
-    if (-not (Get-RunningAvds).ContainsKey($name)) { Stop-XrayForAvd $name; Show-Message "$name is already stopped."; return }
+    if (-not (Get-RunningAvds).ContainsKey($name)) {
+        Stop-XrayForAvd $name
+        $script:RunningSnapshot.Remove($name)
+        Update-AvdList
+        Set-Status "$name is stopped. You can now delete it."
+        return
+    }
     $serial = Get-DeviceForAvd $name
-    if (-not $serial) { Show-Message 'The phone is still booting. Wait a moment and try again.' 'Not ready' ([Windows.Forms.MessageBoxIcon]::Warning); return }
+    if (-not $serial) {
+        try {
+            $targets = @(Get-AvdProcesses -Name $name)
+            if ($targets.Count -eq 0) { throw 'No matching emulator process was found. Refresh the device list and retry.' }
+            $answer = [Windows.Forms.MessageBox]::Show($script:Form, "$name is not responding through ADB. Force stop this phone? Unsaved changes inside Android may be lost.", 'Stop unresponsive phone', [Windows.Forms.MessageBoxButtons]::YesNo, [Windows.Forms.MessageBoxIcon]::Warning)
+            if ($answer -ne [Windows.Forms.DialogResult]::Yes) { return }
+            foreach ($entry in @(Get-AvdProcesses -Name $name)) {
+                if (-not $entry.Process.HasExited) {
+                    $entry.Process.Kill()
+                    if (-not $entry.Process.WaitForExit(3000)) { throw 'The emulator has not exited yet. Refresh and retry.' }
+                }
+            }
+            Stop-XrayForAvd $name
+            $script:RunningSnapshot = Get-RunningAvds
+            Update-AvdList
+            Set-Status "$name stopped. Its saved device data is preserved."
+        } catch { Show-Message $_.Exception.Message 'Stop failed' ([Windows.Forms.MessageBoxIcon]::Error) }
+        return
+    }
     try {
         Set-Status "Stopping $name safely..."
         Stop-DeviceTunnel $serial
@@ -1456,7 +1641,7 @@ function Initialize-RunningDevices {
             $binding = Get-ProxyBinding $name
             if ($binding) {
                 $proxyPort = [int]$binding.port
-                if (-not (Test-TcpPort $proxyPort)) { [void](Start-XrayForAvd $name) }
+                [void](Start-XrayForAvd $name)
             } elseif (Test-TcpPort $script:SharedProxyPort) {
                 $proxyPort = $script:SharedProxyPort
             } else {
@@ -1480,6 +1665,51 @@ function Initialize-RunningDevices {
             Set-Status 'Device initialization will retry after the connection stabilizes.'
         }
     } finally { $script:InitializingDevices = $false }
+}
+
+if ($Maintenance) {
+    $script:AutoLatencyTimer.Stop()
+    function Set-Status { param([string]$Text) $script:WorkerStatus = $Text }
+    function Set-PhoneLatencyResult { param([string]$Name, [string]$Text) $script:LatencyResults[$Name] = $Text }
+    Initialize-RunningDevices
+    if ($MeasureLatency) {
+        foreach ($deviceName in Get-AvdNames) { Test-PhoneProxy -TargetName $deviceName -Automatic }
+    }
+    $snapshot = [ordered]@{
+        running = @((Get-RunningAvds).Keys)
+        latency = $script:LatencyResults
+        status = $script:WorkerStatus
+    } | ConvertTo-Json -Depth 6
+    [IO.File]::WriteAllText($SnapshotPath, $snapshot, [Text.UTF8Encoding]::new($false))
+    return
+}
+
+function Update-BackgroundMaintenance {
+    if ($script:MaintenanceProcess) {
+        if (-not $script:MaintenanceProcess.HasExited) { return }
+        try {
+            if ($script:MaintenanceProcess.ExitCode -eq 0 -and (Test-Path -LiteralPath $script:SnapshotFile)) {
+                $snapshot = [IO.File]::ReadAllText($script:SnapshotFile) | ConvertFrom-Json
+                $script:RunningSnapshot = @{}
+                foreach ($deviceName in $snapshot.running) { $script:RunningSnapshot[$deviceName] = $true }
+                foreach ($entry in $snapshot.latency.PSObject.Properties) { $script:LatencyResults[$entry.Name] = [string]$entry.Value }
+                Update-AvdList
+                Sync-LatencyUi
+                Sync-ActionStates
+                Sync-EmulatorWindowPlacement
+                if ($snapshot.status) { Set-Status $snapshot.status }
+            }
+        } finally {
+            $script:MaintenanceProcess.Dispose()
+            $script:MaintenanceProcess = $null
+            $script:NextMaintenance = [DateTime]::UtcNow.AddSeconds(8)
+        }
+    }
+    if ([DateTime]::UtcNow -lt $script:NextMaintenance -and -not $script:LatencyPending) { return }
+    $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Maintenance -SnapshotPath "{1}"' -f $PSCommandPath, $script:SnapshotFile
+    if ($script:LatencyPending) { $arguments += ' -MeasureLatency' }
+    $script:MaintenanceProcess = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -ArgumentList $arguments -WindowStyle Hidden -PassThru
+    $script:LatencyPending = $false
 }
 
 if ($SelfTest) {
@@ -1534,6 +1764,15 @@ function New-RoundedRectanglePath {
     $path
 }
 
+$script:RunningSnapshot = @{}
+$script:NextMaintenance = [DateTime]::MinValue
+$script:SnapshotFile = Join-Path $script:RuntimeRoot ('manager-status-' + $PID + '.json')
+$script:CardFonts = @{
+    Name = [Drawing.Font]::new('Bahnschrift SemiBold', 14)
+    Status = [Drawing.Font]::new('Segoe UI Semibold', 9)
+    Label = [Drawing.Font]::new('Segoe UI', 8.5)
+    Value = [Drawing.Font]::new('Segoe UI Semibold', 10)
+}
 $script:Form = [Windows.Forms.Form]::new()
 $script:Form.Text = 'Android Social Suite'
 $script:Form.StartPosition = 'CenterScreen'
@@ -1541,7 +1780,7 @@ $script:Form.ClientSize = [Drawing.Size]::new(1180, 760)
 $script:Form.MinimumSize = [Drawing.Size]::new(1120, 720)
 $script:Form.BackColor = [Drawing.Color]::FromArgb(250, 249, 247)
 $script:Form.Font = [Drawing.Font]::new('Segoe UI', 9)
-$script:Form.AllowDrop = $true
+$script:Form.AllowDrop = $false
 $iconPath = @(
     (Join-Path $PSScriptRoot 'app-icon.ico'),
     (Join-Path $PSScriptRoot 'assets\android-social-suite.ico')
@@ -1661,7 +1900,7 @@ $script:Form.Controls.Add($gallerySubtitle)
 
 $script:AvdList = [Windows.Forms.ListView]::new()
 $script:AvdList.Location = [Drawing.Point]::new(24, 216)
-$script:AvdList.Size = [Drawing.Size]::new(1132, 300)
+$script:AvdList.Size = [Drawing.Size]::new(1132, 454)
 $script:AvdList.Anchor = 'Top,Bottom,Left,Right'
 $script:AvdList.View = [Windows.Forms.View]::Tile
 $script:AvdList.TileSize = [Drawing.Size]::new(1090, 132)
@@ -1672,6 +1911,7 @@ $script:AvdList.HeaderStyle = [Windows.Forms.ColumnHeaderStyle]::None
 $script:AvdList.BorderStyle = [Windows.Forms.BorderStyle]::None
 $script:AvdList.BackColor = [Drawing.Color]::FromArgb(250, 249, 247)
 $script:AvdList.HideSelection = $false
+$script:AvdList.MultiSelect = $false
 $script:AvdList.OwnerDraw = $true
 $script:AvdList.Font = [Drawing.Font]::new('Segoe UI', 10)
 [void]$script:AvdList.Columns.Add('Name', 275)
@@ -1686,7 +1926,7 @@ $script:AvdList.Add_DrawItem({
     $graphics = $eventArgs.Graphics
     $graphics.SmoothingMode = [Drawing.Drawing2D.SmoothingMode]::AntiAlias
     $bounds = [Drawing.RectangleF]::new($eventArgs.Bounds.X + 2, $eventArgs.Bounds.Y + 3, $eventArgs.Bounds.Width - 8, $eventArgs.Bounds.Height - 8)
-    $selected = ($eventArgs.State -band [Windows.Forms.ListViewItemStates]::Selected) -ne 0
+    $selected = $eventArgs.Item.Selected
     $background = if ($selected) { [Drawing.Color]::FromArgb(239, 249, 252) } else { [Drawing.Color]::FromArgb(255, 255, 254) }
     $border = if ($selected) { [Drawing.Color]::FromArgb(7, 143, 197) } else { [Drawing.Color]::FromArgb(214, 223, 229) }
     $path = New-RoundedRectanglePath $bounds 10
@@ -1707,14 +1947,14 @@ $script:AvdList.Add_DrawItem({
         $profile = if ($item.SubItems.Count -gt 3) { $item.SubItems[3].Text } else { 'Existing profile' }
         $latency = if ($item.SubItems.Count -gt 4) { $item.SubItems[4].Text } else { 'Not tested' }
         $nameX = [int]($bounds.X + 118)
-        [Windows.Forms.TextRenderer]::DrawText($graphics, $name, [Drawing.Font]::new('Bahnschrift SemiBold', 14), [Drawing.Point]::new($nameX, [int]($bounds.Y + 18)), [Drawing.Color]::FromArgb(15, 35, 58))
+        [Windows.Forms.TextRenderer]::DrawText($graphics, $name, $script:CardFonts.Name, [Drawing.Point]::new($nameX, [int]($bounds.Y + 18)), [Drawing.Color]::FromArgb(15, 35, 58))
         $statusColor = if ($status -eq 'Running') { [Drawing.Color]::FromArgb(0, 126, 94) } else { [Drawing.Color]::FromArgb(194, 48, 42) }
         $statusBack = if ($status -eq 'Running') { [Drawing.Color]::FromArgb(226, 246, 238) } else { [Drawing.Color]::FromArgb(255, 232, 229) }
         $statusRect = [Drawing.RectangleF]::new($nameX, $bounds.Y + 55, 104, 30)
         $statusPath = New-RoundedRectanglePath $statusRect 14
         $statusBrush = [Drawing.SolidBrush]::new($statusBack)
         try { $graphics.FillPath($statusBrush, $statusPath) } finally { $statusBrush.Dispose(); $statusPath.Dispose() }
-        [Windows.Forms.TextRenderer]::DrawText($graphics, $status, [Drawing.Font]::new('Segoe UI Semibold', 9), [Drawing.Rectangle]::new($nameX + 10, [int]($bounds.Y + 61), 86, 20), $statusColor, [Windows.Forms.TextFormatFlags]::HorizontalCenter)
+        [Windows.Forms.TextRenderer]::DrawText($graphics, $status, $script:CardFonts.Status, [Drawing.Rectangle]::new($nameX + 10, [int]($bounds.Y + 61), 86, 20), $statusColor, [Windows.Forms.TextFormatFlags]::HorizontalCenter)
         $available = $bounds.Width - 340
         $proxyX = [int]($bounds.X + 330)
         $profileX = [int]($bounds.X + 330 + ($available * 0.34))
@@ -1724,8 +1964,8 @@ $script:AvdList.Add_DrawItem({
             @{ X = $profileX; Label = 'Hardware profile'; Value = $profile },
             @{ X = $latencyX; Label = 'Latency'; Value = $latency }
         )) {
-            [Windows.Forms.TextRenderer]::DrawText($graphics, $field.Label, [Drawing.Font]::new('Segoe UI', 8.5), [Drawing.Point]::new($field.X, [int]($bounds.Y + 37)), [Drawing.Color]::FromArgb(91, 108, 126))
-            [Windows.Forms.TextRenderer]::DrawText($graphics, [string]$field.Value, [Drawing.Font]::new('Segoe UI Semibold', 10), [Drawing.Rectangle]::new($field.X, [int]($bounds.Y + 60), 230, 28), [Drawing.Color]::FromArgb(22, 43, 66), [Windows.Forms.TextFormatFlags]::EndEllipsis)
+            [Windows.Forms.TextRenderer]::DrawText($graphics, $field.Label, $script:CardFonts.Label, [Drawing.Point]::new($field.X, [int]($bounds.Y + 37)), [Drawing.Color]::FromArgb(91, 108, 126))
+            [Windows.Forms.TextRenderer]::DrawText($graphics, [string]$field.Value, $script:CardFonts.Value, [Drawing.Rectangle]::new($field.X, [int]($bounds.Y + 60), 230, 28), [Drawing.Color]::FromArgb(22, 43, 66), [Windows.Forms.TextFormatFlags]::EndEllipsis)
         }
     } finally {
         $fill.Dispose()
@@ -1736,7 +1976,26 @@ $script:AvdList.Add_DrawItem({
 $script:AvdList.Add_Resize({
     if ($script:AvdList.ClientSize.Width -gt 100) { $script:AvdList.TileSize = [Drawing.Size]::new($script:AvdList.ClientSize.Width - 26, 132) }
 })
-$script:AvdList.Add_SelectedIndexChanged({ Sync-ActionStates; $script:AvdList.Invalidate() })
+$script:AvdList.Add_MouseUp({
+    param($sender, $eventArgs)
+    if ($eventArgs.Button -ne [Windows.Forms.MouseButtons]::Left) { return }
+    $target = $null
+    foreach ($candidate in $sender.Items) {
+        if ($candidate.Bounds.Contains($eventArgs.Location)) { $target = $candidate; break }
+    }
+    if (-not $target) { return }
+    foreach ($candidate in $sender.Items) {
+        if ($candidate -ne $target -and $candidate.Selected) { $candidate.Selected = $false }
+    }
+    $target.Selected = $true
+    $target.Focused = $true
+    Sync-ActionStates
+    $sender.Invalidate()
+})
+$script:AvdList.Add_SelectedIndexChanged({
+    Sync-ActionStates
+    $script:AvdList.Invalidate()
+})
 $script:Form.Controls.Add($script:AvdList)
 
 $script:SummaryLabel = [Windows.Forms.Label]::new()
@@ -1746,54 +2005,6 @@ $script:SummaryLabel.Anchor = 'Bottom,Left,Right'
 $script:SummaryLabel.Font = [Drawing.Font]::new('Segoe UI', 8.5)
 $script:SummaryLabel.ForeColor = [Drawing.Color]::FromArgb(83, 101, 119)
 $script:Form.Controls.Add($script:SummaryLabel)
-
-$dropPanel = [Windows.Forms.Panel]::new()
-$dropPanel.Location = [Drawing.Point]::new(24, 540)
-$dropPanel.Size = [Drawing.Size]::new(1132, 130)
-$dropPanel.Anchor = 'Bottom,Left,Right'
-$dropPanel.BackColor = [Drawing.Color]::FromArgb(245, 250, 253)
-$dropPanel.BorderStyle = [Windows.Forms.BorderStyle]::None
-$dropPanel.AllowDrop = $true
-$dropPanel.Add_Paint({
-    param($sender, $eventArgs)
-    $pen = [Drawing.Pen]::new([Drawing.Color]::FromArgb(126, 190, 225), 1.5)
-    $pen.DashStyle = [Drawing.Drawing2D.DashStyle]::Dash
-    try { $eventArgs.Graphics.DrawRectangle($pen, 1, 1, $sender.Width - 3, $sender.Height - 3) } finally { $pen.Dispose() }
-})
-$dropLabel = [Windows.Forms.Label]::new()
-$dropLabel.Text = "Drop images, videos, or APKs here`r`nMedia is added to the AndroidSocialSuite album"
-$dropLabel.Font = [Drawing.Font]::new('Segoe UI Semibold', 11)
-$dropLabel.ForeColor = [Drawing.Color]::FromArgb(24, 59, 87)
-$dropLabel.TextAlign = [Drawing.ContentAlignment]::MiddleCenter
-$dropLabel.Location = [Drawing.Point]::new(4, 4)
-$dropLabel.Size = [Drawing.Size]::new($dropPanel.ClientSize.Width - 8, $dropPanel.ClientSize.Height - 8)
-$dropLabel.Anchor = 'Top,Bottom,Left,Right'
-$dropLabel.BackColor = $dropPanel.BackColor
-$dropLabel.AllowDrop = $true
-$dropPanel.Controls.Add($dropLabel)
-$script:Form.Controls.Add($dropPanel)
-
-$mediaDragEnter = {
-    param($sender, $eventArgs)
-    if ($eventArgs.Data.GetDataPresent([Windows.Forms.DataFormats]::FileDrop)) {
-        $paths = [string[]]$eventArgs.Data.GetData([Windows.Forms.DataFormats]::FileDrop)
-        $hasSupportedFile = @($paths | Where-Object {
-            ($script:MediaExtensions -contains [IO.Path]::GetExtension($_).ToLowerInvariant()) -or
-            ($script:ApkExtensions -contains [IO.Path]::GetExtension($_).ToLowerInvariant())
-        }).Count -gt 0
-        $eventArgs.Effect = if ($hasSupportedFile) { [Windows.Forms.DragDropEffects]::Copy } else { [Windows.Forms.DragDropEffects]::None }
-    }
-}
-$mediaDragDrop = {
-    param($sender, $eventArgs)
-    if ($eventArgs.Data.GetDataPresent([Windows.Forms.DataFormats]::FileDrop)) {
-        Handle-DroppedFiles ([string[]]$eventArgs.Data.GetData([Windows.Forms.DataFormats]::FileDrop))
-    }
-}
-$dropPanel.Add_DragEnter($mediaDragEnter)
-$dropPanel.Add_DragDrop($mediaDragDrop)
-$dropLabel.Add_DragEnter($mediaDragEnter)
-$dropLabel.Add_DragDrop($mediaDragDrop)
 
 $autoTestLabel = [Windows.Forms.Label]::new()
 $autoTestLabel.Text = 'Automatic latency testing runs every 5 minutes.'
@@ -1817,13 +2028,14 @@ $script:Form.Controls.Add($script:StatusLabel)
 
 $script:AvdList.Add_DoubleClick({ Start-Phone })
 $script:Form.Add_Shown({
-    try { Update-AvdList; Sync-LatencyUi; Sync-ActionStates; Sync-EmulatorWindowPlacement }
+    try { Update-AvdList; Sync-LatencyUi; Sync-ActionStates; Update-BackgroundMaintenance }
     catch { Set-Status 'Device status will refresh automatically.' }
 })
 $timer = [Windows.Forms.Timer]::new()
-$timer.Interval = 4000
+$timer.Interval = 500
 $timer.Add_Tick({
-    try { Update-AvdList; Initialize-RunningDevices; Sync-EmulatorWindowPlacement }
+    if ($script:MovingWindow) { return }
+    try { Update-BackgroundMaintenance }
     catch {
         if ($_.Exception.Message -notmatch '(?i)error:\s*(closed|offline)|device.*not found') {
             Set-Status 'Device status will refresh automatically.'
@@ -1831,6 +2043,8 @@ $timer.Add_Tick({
     }
 })
 $timer.Start()
+$script:Form.Add_ResizeBegin({ $script:MovingWindow = $true })
+$script:Form.Add_ResizeEnd({ $script:MovingWindow = $false })
 $script:Form.Add_FormClosed({ $script:AutoLatencyTimer.Stop() })
 if ($CapturePreview) {
     Update-AvdList
@@ -1856,3 +2070,4 @@ $timer.Stop()
 $timer.Dispose()
 $script:AutoLatencyTimer.Stop()
 $script:AutoLatencyTimer.Dispose()
+foreach ($font in $script:CardFonts.Values) { $font.Dispose() }

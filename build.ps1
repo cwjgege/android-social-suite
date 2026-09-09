@@ -1,11 +1,12 @@
 param(
-    [string]$Configuration = 'Release'
+    [string]$Configuration = 'Release',
+    [string]$OutputName = 'AndroidSocialSuite.exe'
 )
 
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 $releaseDirectory = Join-Path $root 'release'
-$output = Join-Path $releaseDirectory 'AndroidSocialSuite.exe'
+$output = Join-Path $releaseDirectory $OutputName
 $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 $xrayExe = Join-Path $root 'vendor\xray\xray.exe'
 $xrayLicense = Join-Path $root 'vendor\xray\LICENSE.txt'
