@@ -104,23 +104,125 @@ function Get-ArchiveInfo {
     }
 }
 
+function Test-ArchiveFile {
+    param(
+        [string]$Path,
+        [pscustomobject]$Archive
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    try {
+        (Get-FileHash -LiteralPath $Path -Algorithm $Archive.HashType).Hash.ToUpperInvariant() -eq $Archive.Checksum
+    } catch { $false }
+}
+
+function Invoke-ResumableDownload {
+    param(
+        [pscustomobject]$Archive,
+        [string]$Destination,
+        [System.Windows.Forms.Label]$StatusLabel
+    )
+
+    $partialPath = $Destination + '.partial'
+    [void](New-Item -ItemType Directory -Path (Split-Path $Destination -Parent) -Force)
+    if (Test-ArchiveFile $Destination $Archive) { return }
+    if (Test-Path -LiteralPath $Destination) { [IO.File]::Delete($Destination) }
+    if (Test-ArchiveFile $partialPath $Archive) {
+        [IO.File]::Move($partialPath, $Destination)
+        return
+    }
+
+    $lastError = $null
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        $response = $null
+        $inputStream = $null
+        $outputStream = $null
+        try {
+            $existingLength = if (Test-Path -LiteralPath $partialPath) { (Get-Item -LiteralPath $partialPath).Length } else { 0L }
+            $request = [Net.HttpWebRequest]::Create($Archive.Url)
+            $request.Method = 'GET'
+            $request.UserAgent = 'Android-Social-Suite'
+            $request.Timeout = 30000
+            $request.ReadWriteTimeout = 30000
+            if ($existingLength -gt 0) { $request.AddRange($existingLength) }
+
+            $response = [Net.HttpWebResponse]$request.GetResponse()
+            $isPartial = $response.StatusCode -eq [Net.HttpStatusCode]::PartialContent
+            if ($existingLength -gt 0 -and -not $isPartial) {
+                $response.Dispose()
+                $response = $null
+                [IO.File]::Delete($partialPath)
+                throw 'The download server did not accept the resume request; restarting this package.'
+            }
+
+            $mode = if ($existingLength -gt 0) { [IO.FileMode]::Append } else { [IO.FileMode]::Create }
+            $outputStream = [IO.File]::Open($partialPath, $mode, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+            $inputStream = $response.GetResponseStream()
+            $totalLength = if ($response.ContentLength -gt 0) { $existingLength + $response.ContentLength } else { 0L }
+            $downloaded = $existingLength
+            $buffer = New-Object byte[] 1048576
+            $lastUiUpdate = [DateTime]::UtcNow.AddSeconds(-1)
+            while (($read = $inputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                $outputStream.Write($buffer, 0, $read)
+                $downloaded += $read
+                if (([DateTime]::UtcNow - $lastUiUpdate).TotalMilliseconds -ge 250) {
+                    if ($StatusLabel) {
+                        if ($totalLength -gt 0) {
+                            $percent = [Math]::Min(100, [Math]::Round(($downloaded * 100.0) / $totalLength))
+                            $StatusLabel.Text = 'Downloading {0}: {1:N1} / {2:N1} MB ({3}%), attempt {4}/5' -f $Archive.PackagePath, ($downloaded / 1MB), ($totalLength / 1MB), $percent, $attempt
+                        } else {
+                            $StatusLabel.Text = 'Downloading {0}: {1:N1} MB, attempt {2}/5' -f $Archive.PackagePath, ($downloaded / 1MB), $attempt
+                        }
+                    }
+                    [System.Windows.Forms.Application]::DoEvents()
+                    $lastUiUpdate = [DateTime]::UtcNow
+                }
+            }
+            $outputStream.Flush()
+            $outputStream.Dispose()
+            $outputStream = $null
+            $inputStream.Dispose()
+            $inputStream = $null
+            $response.Dispose()
+            $response = $null
+
+            if (-not (Test-ArchiveFile $partialPath $Archive)) {
+                [IO.File]::Delete($partialPath)
+                throw "Checksum failed for $($Archive.PackagePath)."
+            }
+            [IO.File]::Move($partialPath, $Destination)
+            return
+        } catch {
+            $lastError = $_.Exception
+            if ($attempt -lt 5) {
+                if ($StatusLabel) { $StatusLabel.Text = "Download interrupted. Retrying $($Archive.PackagePath) ($($attempt + 1)/5)..." }
+                [System.Windows.Forms.Application]::DoEvents()
+                Start-Sleep -Seconds ([Math]::Min(8, [Math]::Pow(2, $attempt - 1)))
+            }
+        } finally {
+            if ($outputStream) { $outputStream.Dispose() }
+            if ($inputStream) { $inputStream.Dispose() }
+            if ($response) { $response.Dispose() }
+        }
+    }
+    throw "Download failed after 5 attempts for $($Archive.PackagePath). Partial data was kept for the next run. $($lastError.Message)"
+}
+
 function Install-Archive {
     param(
         [pscustomobject]$Archive,
         [string]$ExpectedFolder,
         [string]$Destination,
-        [string]$WorkRoot
+        [string]$WorkRoot,
+        [string]$CacheRoot,
+        [System.Windows.Forms.Label]$StatusLabel
     )
 
     $safeName = ($Archive.PackagePath -replace '[^A-Za-z0-9_-]', '_')
-    $zipPath = Join-Path $WorkRoot ($safeName + '.zip')
+    $zipPath = Join-Path $CacheRoot ($safeName + '.zip')
     $extractPath = Join-Path $WorkRoot ($safeName + '-extract')
 
-    Invoke-WebRequest -UseBasicParsing -Uri $Archive.Url -OutFile $zipPath
-    $actualHash = (Get-FileHash -LiteralPath $zipPath -Algorithm $Archive.HashType).Hash.ToUpperInvariant()
-    if ($actualHash -ne $Archive.Checksum) {
-        throw "Checksum failed for $($Archive.PackagePath)."
-    }
+    Invoke-ResumableDownload -Archive $Archive -Destination $zipPath -StatusLabel $StatusLabel
 
     [void](New-Item -ItemType Directory -Path $extractPath -Force)
     Expand-Archive -LiteralPath $zipPath -DestinationPath $extractPath -Force
@@ -336,6 +438,8 @@ function Install-AndroidEnvironment {
         [void](New-Item -ItemType Directory -Path (Join-Path $Root 'android-sdk') -Force)
         [void](New-Item -ItemType Directory -Path (Join-Path $Root 'android-avd') -Force)
         [void](New-Item -ItemType Directory -Path (Join-Path $Root 'emulator-home') -Force)
+        $cacheRoot = Join-Path $Root 'download-cache'
+        [void](New-Item -ItemType Directory -Path $cacheRoot -Force)
 
         $sdkRoot = Join-Path $Root 'android-sdk'
         if (-not $state.Emulator -or -not $state.PlatformTools) {
@@ -346,13 +450,13 @@ function Install-AndroidEnvironment {
             $emulator = Get-ArchiveInfo $script:RepositoryUrl 'emulator' $script:RepositoryBaseUrl -WindowsOnly
             $label.Text = 'Downloading and installing Android Emulator...'
             [System.Windows.Forms.Application]::DoEvents()
-            Install-Archive $emulator 'emulator' (Join-Path $sdkRoot 'emulator') $workRoot
+            Install-Archive -Archive $emulator -ExpectedFolder 'emulator' -Destination (Join-Path $sdkRoot 'emulator') -WorkRoot $workRoot -CacheRoot $cacheRoot -StatusLabel $label
         }
         if (-not $state.PlatformTools) {
             $platformTools = Get-ArchiveInfo $script:RepositoryUrl 'platform-tools' $script:RepositoryBaseUrl -WindowsOnly
             $label.Text = 'Downloading and installing Platform Tools...'
             [System.Windows.Forms.Application]::DoEvents()
-            Install-Archive $platformTools 'platform-tools' (Join-Path $sdkRoot 'platform-tools') $workRoot
+            Install-Archive -Archive $platformTools -ExpectedFolder 'platform-tools' -Destination (Join-Path $sdkRoot 'platform-tools') -WorkRoot $workRoot -CacheRoot $cacheRoot -StatusLabel $label
         }
         if (-not $state.SystemImage) {
             $label.Text = 'Reading Android system image metadata...'
@@ -360,7 +464,7 @@ function Install-AndroidEnvironment {
             $systemImage = Get-ArchiveInfo $script:SystemImageRepositoryUrl $script:SystemImagePackage $script:SystemImageBaseUrl
             $label.Text = 'Downloading Android 14 Google Play image. This is the largest step...'
             [System.Windows.Forms.Application]::DoEvents()
-            Install-Archive $systemImage 'x86_64' (Join-Path $sdkRoot 'system-images\android-34\google_apis_playstore\x86_64') $workRoot
+            Install-Archive -Archive $systemImage -ExpectedFolder 'x86_64' -Destination (Join-Path $sdkRoot 'system-images\android-34\google_apis_playstore\x86_64') -WorkRoot $workRoot -CacheRoot $cacheRoot -StatusLabel $label
         }
         if (-not $state.Template) {
             $label.Text = 'Creating the protected device template...'
