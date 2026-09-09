@@ -308,6 +308,46 @@ function Install-XrayCore {
     }
 }
 
+function Install-ApplicationEntryPoints {
+    param([string]$Root)
+
+    $sourceExe = $env:ANDROID_SOCIAL_LAUNCHER_EXE
+    if ([string]::IsNullOrWhiteSpace($sourceExe) -or -not (Test-Path -LiteralPath $sourceExe -PathType Leaf)) {
+        return
+    }
+
+    try {
+        $installedExe = Join-Path $Root 'AndroidSocialSuite.exe'
+        $sourceFullPath = [IO.Path]::GetFullPath($sourceExe)
+        $installedFullPath = [IO.Path]::GetFullPath($installedExe)
+        if (-not $sourceFullPath.Equals($installedFullPath, [StringComparison]::OrdinalIgnoreCase)) {
+            $needsCopy = (-not (Test-Path -LiteralPath $installedFullPath -PathType Leaf)) -or
+                ((Get-FileHash -LiteralPath $sourceFullPath -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $installedFullPath -Algorithm SHA256).Hash)
+            if ($needsCopy) { Copy-Item -LiteralPath $sourceFullPath -Destination $installedFullPath -Force }
+        }
+
+        $desktop = [Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)
+        $programs = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::StartMenu)) 'Programs'
+        [void](New-Item -ItemType Directory -Path $programs -Force)
+        $shell = New-Object -ComObject WScript.Shell
+        foreach ($shortcutPath in @(
+            (Join-Path $desktop 'Android Social Suite.lnk'),
+            (Join-Path $programs 'Android Social Suite.lnk')
+        )) {
+            $shortcut = $shell.CreateShortcut($shortcutPath)
+            $shortcut.TargetPath = $installedFullPath
+            $shortcut.WorkingDirectory = $Root
+            $shortcut.IconLocation = "$installedFullPath,0"
+            $shortcut.Description = 'Open Android Social Suite virtual device manager'
+            $shortcut.Save()
+            [void][Runtime.InteropServices.Marshal]::ReleaseComObject($shortcut)
+        }
+        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($shell)
+    } catch {
+        Show-SuiteMessage "Android Social Suite is installed, but Windows could not create its shortcuts.`r`n`r`nYou can still open it from:`r`n$(Join-Path $Root 'AndroidSocialSuite.exe')`r`n`r`n$($_.Exception.Message)" ([System.Windows.Forms.MessageBoxIcon]::Warning)
+    }
+}
+
 function New-BaseAvd {
     param(
         [string]$Root,
@@ -500,6 +540,7 @@ try {
     }
 
     Install-XrayCore $root
+    Install-ApplicationEntryPoints $root
 
     $env:ANDROID_SOCIAL_HOME = $root
     $managerPath = Join-Path $PSScriptRoot 'android-avd-manager.ps1'

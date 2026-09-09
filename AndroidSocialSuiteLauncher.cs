@@ -47,6 +47,8 @@ internal static class AndroidSocialSuiteLauncher
             startInfo.UseShellExecute = false;
             startInfo.CreateNoWindow = true;
             startInfo.WindowStyle = ProcessWindowStyle.Hidden;
+            startInfo.EnvironmentVariables["ANDROID_SOCIAL_LAUNCHER_EXE"] =
+                Assembly.GetExecutingAssembly().Location;
 
             using (Process process = Process.Start(startInfo))
             {
