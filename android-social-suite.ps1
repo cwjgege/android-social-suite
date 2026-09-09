@@ -208,6 +208,34 @@ function Invoke-ResumableDownload {
     throw "Download failed after 5 attempts for $($Archive.PackagePath). Partial data was kept for the next run. $($lastError.Message)"
 }
 
+function Move-DirectoryPortable {
+    param(
+        [string]$Source,
+        [string]$Destination
+    )
+
+    if (-not (Test-Path -LiteralPath $Source -PathType Container)) {
+        throw "Source directory does not exist: $Source"
+    }
+    if (Test-Path -LiteralPath $Destination) {
+        [IO.Directory]::Delete($Destination, $true)
+    }
+
+    [void](New-Item -ItemType Directory -Path $Destination -Force)
+    $sourceRoot = [IO.Path]::GetFullPath($Source).TrimEnd('\')
+    foreach ($directory in Get-ChildItem -LiteralPath $sourceRoot -Directory -Recurse -Force) {
+        $relativePath = $directory.FullName.Substring($sourceRoot.Length).TrimStart('\')
+        [void](New-Item -ItemType Directory -Path (Join-Path $Destination $relativePath) -Force)
+    }
+    foreach ($file in Get-ChildItem -LiteralPath $sourceRoot -File -Recurse -Force) {
+        $relativePath = $file.FullName.Substring($sourceRoot.Length).TrimStart('\')
+        $targetPath = Join-Path $Destination $relativePath
+        [void](New-Item -ItemType Directory -Path (Split-Path $targetPath -Parent) -Force)
+        [IO.File]::Copy($file.FullName, $targetPath, $true)
+    }
+    [IO.Directory]::Delete($sourceRoot, $true)
+}
+
 function Install-Archive {
     param(
         [pscustomobject]$Archive,
@@ -240,7 +268,7 @@ function Install-Archive {
     if (Test-Path -LiteralPath $Destination) {
         [IO.Directory]::Delete($Destination, $true)
     }
-    [IO.Directory]::Move($source, $Destination)
+    Move-DirectoryPortable -Source $source -Destination $Destination
 }
 
 function Get-AndroidEnvironmentState {
@@ -294,7 +322,7 @@ function Install-XrayCore {
                 [Microsoft.VisualBasic.FileIO.UICancelOption]::DoNothing
             )
         }
-        [IO.Directory]::Move($extractPath, $destination)
+        Move-DirectoryPortable -Source $extractPath -Destination $destination
     }
     finally {
         if (Test-Path -LiteralPath $workRoot) {
