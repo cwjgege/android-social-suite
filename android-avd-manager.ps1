@@ -486,17 +486,30 @@ function Set-Status {
 }
 
 function Get-XrayExe {
-    $candidates = @(
-        (Join-Path $script:BaseRoot 'xray-core\xray.exe'),
-        $env:XRAY_EXE,
-        (Join-Path $env:USERPROFILE 'Desktop\v2rayN-windows-64\v2rayN-windows-64\bin\xray\xray.exe'),
-        (Join-Path $env:USERPROFILE 'Desktop\v2rayN_v5.39\v2rayN-Core\xray.exe')
-    )
-    foreach ($candidate in $candidates) {
-        if (-not [string]::IsNullOrWhiteSpace($candidate) -and (Test-Path -LiteralPath $candidate)) {
-            return [IO.Path]::GetFullPath($candidate)
-        }
+    param([string]$ConfigJson)
+    $hysteria2 = $false
+    if ($ConfigJson) {
+        $parsed = $ConfigJson | ConvertFrom-Json
+        $hysteria2 = @($parsed.outbounds | Where-Object { $_.protocol -eq 'hysteria' -or $_.streamSettings.network -eq 'hysteria' }).Count -gt 0
     }
+    if ($hysteria2) {
+        $candidates = @(
+            (Join-Path $script:BaseRoot 'xray-hysteria2\xray.exe'),
+            (Join-Path $PSScriptRoot 'xray-hysteria2.exe'),
+            (Join-Path $PSScriptRoot 'vendor\xray-hysteria2\xray.exe')
+        )
+    } else {
+        $candidates = @(
+            (Join-Path $script:BaseRoot 'xray-core\xray.exe'),
+            $env:XRAY_EXE,
+            (Join-Path $env:USERPROFILE 'Desktop\v2rayN-windows-64\v2rayN-windows-64\bin\xray\xray.exe'),
+            (Join-Path $env:USERPROFILE 'Desktop\v2rayN_v5.39\v2rayN-Core\xray.exe')
+        )
+    }
+    foreach ($candidate in $candidates) {
+        if (-not [string]::IsNullOrWhiteSpace($candidate) -and (Test-Path -LiteralPath $candidate)) { return [IO.Path]::GetFullPath($candidate) }
+    }
+    if ($hysteria2) { throw 'The bundled Hysteria2 core is missing. Reopen the Hysteria2-enabled AndroidSocialSuite.exe to install it.' }
     $null
 }
 
@@ -937,6 +950,8 @@ function Get-ProxyType {
     if ($trimmed.StartsWith('{')) { return 'Xray JSON' }
     if ($trimmed -match '^([A-Za-z0-9+.-]+)://') {
         switch ($Matches[1].ToLowerInvariant()) {
+            'hysteria2' { 'Hysteria2' }
+            'hy2' { 'Hysteria2' }
             'vless' { 'VLESS' }
             'vmess' { 'VMess' }
             'trojan' { 'Trojan' }
@@ -1033,6 +1048,93 @@ function New-ProxyEnvelope {
     }
 }
 
+function New-Hysteria2ProxyConfigObject {
+    param([string]$Value, [int]$Port)
+    $uriMatch = [Regex]::Match($Value.Trim(), '^(?i:hysteria2|hy2)://(?<authority>[^/?#]+)(?:/)?(?:\?(?<query>[^#]*))?(?:#.*)?$')
+    if (-not $uriMatch.Success) { throw 'Invalid Hysteria2 URL. Use hysteria2://auth@host:port or hy2://auth@host:port.' }
+    $authority = $uriMatch.Groups['authority'].Value
+    $auth = ''
+    $at = $authority.LastIndexOf('@')
+    if ($at -ge 0) {
+        $auth = [Uri]::UnescapeDataString($authority.Substring(0, $at))
+        $authority = $authority.Substring($at + 1)
+    }
+    $endpoint = [Regex]::Match($authority, '^(?:\[(?<ipv6>[^\]]+)\]|(?<host>[^:\s]+))(?::(?<ports>[0-9,-]+))?$')
+    if (-not $endpoint.Success) { throw 'Invalid Hysteria2 endpoint. Put IPv6 addresses in brackets and use valid UDP ports.' }
+    $server = if ($endpoint.Groups['ipv6'].Success) { $endpoint.Groups['ipv6'].Value } else { $endpoint.Groups['host'].Value }
+    if ([Uri]::CheckHostName($server) -eq [UriHostNameType]::Unknown) { throw 'Invalid Hysteria2 hostname or IP address.' }
+    $query = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($pair in $uriMatch.Groups['query'].Value.Split('&', [StringSplitOptions]::RemoveEmptyEntries)) {
+        $pieces = $pair.Split('=', 2)
+        $key = [Uri]::UnescapeDataString($pieces[0])
+        if ($key -notin @('sni','peer','insecure','allowInsecure','obfs','obfs-password','pinSHA256','ech','alpn','mport')) {
+            throw "Unsupported Hysteria2 URL parameter: $key. It was not silently ignored."
+        }
+        if ($query.ContainsKey($key)) { throw "Duplicate Hysteria2 URL parameter: $key" }
+        $query[$key] = if ($pieces.Count -gt 1) { [Uri]::UnescapeDataString($pieces[1]) } else { '' }
+    }
+    $ports = if ($endpoint.Groups['ports'].Success) { $endpoint.Groups['ports'].Value } else { '443' }
+    if ($query.ContainsKey('mport')) {
+        if (-not $query['mport']) { throw 'The Hysteria2 mport list is empty.' }
+        $ports = $query['mport']
+    }
+    $firstPort = 0
+    foreach ($part in $ports.Split(',')) {
+        $range = [Regex]::Match($part, '^(?<low>[0-9]{1,5})(?:-(?<high>[0-9]{1,5}))?$')
+        if (-not $range.Success) { throw 'Invalid Hysteria2 port list or port range.' }
+        $low = [int]$range.Groups['low'].Value
+        $high = if ($range.Groups['high'].Success) { [int]$range.Groups['high'].Value } else { $low }
+        if ($low -lt 1 -or $high -gt 65535 -or $high -lt $low) { throw 'Hysteria2 UDP ports must be between 1 and 65535, with ascending ranges.' }
+        if ($firstPort -eq 0) { $firstPort = $low }
+    }
+    $sni = Get-QueryValue $query 'sni' (Get-QueryValue $query 'peer' $server)
+    if ($query.ContainsKey('sni') -and $query.ContainsKey('peer') -and $query['sni'] -cne $query['peer']) { throw 'Conflicting Hysteria2 sni and peer parameters.' }
+    if ([string]::IsNullOrWhiteSpace($sni) -or $sni -match '[\s/\\]') { throw 'Invalid Hysteria2 TLS server name.' }
+    $tls = [ordered]@{ serverName = $sni; alpn = @('h3') }
+    if ($query.ContainsKey('alpn') -and $query['alpn'] -notin @('', 'h3')) { throw 'Hysteria2 uses ALPN h3; the supplied ALPN is incompatible.' }
+    $insecure = $false
+    $insecureSpecified = $false
+    foreach ($key in @('insecure','allowInsecure')) {
+        if (-not $query.ContainsKey($key)) { continue }
+        if ($query[$key] -notin @('0','1','false','true')) { throw "Invalid Hysteria2 $key value; use 0 or 1." }
+        $flag = $query[$key] -in @('1','true')
+        if ($insecureSpecified -and $flag -ne $insecure) { throw 'Conflicting Hysteria2 certificate verification parameters.' }
+        $insecure = $flag
+        $insecureSpecified = $true
+    }
+    $pin = Get-QueryValue $query 'pinSHA256' ''
+    if ($pin) {
+        $pin = $pin.Replace(':', '')
+        if ($pin -notmatch '^[0-9a-fA-F]{64}$') { throw 'pinSHA256 must contain the 32-byte certificate SHA-256 fingerprint in hexadecimal.' }
+        $tls['pinnedPeerCertSha256'] = $pin.ToLowerInvariant()
+    }
+    if ($insecure -and -not $pin) { throw 'This Hysteria2 core requires pinSHA256 for self-signed certificates. Ask the provider for the certificate fingerprint, or use a valid trusted certificate; insecure=1 alone is unsupported.' }
+    if ($query.ContainsKey('ech')) {
+        try { $ech = [Convert]::FromBase64String($query['ech']) } catch { throw 'Hysteria2 ech must be a base64 ECH config list.' }
+        if ($ech.Length -eq 0) { throw 'The Hysteria2 ECH config list is empty.' }
+        $tls['echConfigList'] = $query['ech']
+    }
+    $mask = [ordered]@{ quicParams = [ordered]@{ congestion = 'bbr' } }
+    if ($ports.Contains(',') -or $ports.Contains('-')) { $mask.quicParams['udpHop'] = [ordered]@{ ports = $ports; interval = 30 } }
+    $obfs = Get-QueryValue $query 'obfs' ''
+    $obfsPassword = Get-QueryValue $query 'obfs-password' ''
+    if ($obfs -and $obfs -ne 'salamander') { throw 'This Hysteria2 build supports Salamander obfuscation, not Gecko or other obfuscation types.' }
+    if ($obfs -eq 'salamander') {
+        if (-not $obfsPassword) { throw 'Salamander requires an obfs-password.' }
+        $mask['udp'] = @([ordered]@{ type = 'salamander'; settings = [ordered]@{ password = $obfsPassword } })
+    } elseif ($obfsPassword) { throw 'obfs-password was supplied without obfs=salamander.' }
+    $outbound = [ordered]@{
+        protocol = 'hysteria'
+        settings = [ordered]@{ version = 2; address = $server; port = $firstPort }
+        streamSettings = [ordered]@{
+            network = 'hysteria'; security = 'tls'; tlsSettings = $tls
+            hysteriaSettings = [ordered]@{ version = 2; auth = $auth }
+            finalmask = $mask
+        }
+    }
+    New-ProxyEnvelope $outbound $Port
+}
+
 function New-UniversalProxyConfigObject {
     param([string]$ProxyValue, [int]$Port)
     $value = $ProxyValue.Trim()
@@ -1043,6 +1145,7 @@ function New-UniversalProxyConfigObject {
         if ($outbound.protocol -notin @('vless', 'vmess', 'trojan', 'shadowsocks', 'socks', 'http', 'wireguard', 'hysteria')) { throw "Unsupported Xray outbound protocol: $($outbound.protocol)" }
         return New-ProxyEnvelope $outbound $Port
     }
+    if ($value -match '^(hysteria2|hy2)://') { return New-Hysteria2ProxyConfigObject $value $Port }
     if ($value -match '^vless://') {
         $vlessConfig = New-XrayConfigObject $value $Port
         return New-ProxyEnvelope $vlessConfig.outbounds[0] $Port
@@ -1116,7 +1219,7 @@ function New-UniversalProxyConfigObject {
         }
         return New-ProxyEnvelope $outbound $Port
     }
-    throw 'Supported inputs: VLESS, VMess, Trojan, Shadowsocks, SOCKS5, HTTP/HTTPS, or an Xray outbound JSON object.'
+    throw 'Supported inputs: Hysteria2 (hy2), VLESS, VMess, Trojan, Shadowsocks, SOCKS5, HTTP/HTTPS, or an Xray outbound JSON object.'
 }
 
 function New-XrayConfigJson {
@@ -1145,7 +1248,7 @@ function Get-XrayProcessForAvd {
     param([string]$Name)
     $configPath = Get-XrayConfigPath $Name
     try {
-        foreach ($process in @(Get-Process -Name xray -ErrorAction SilentlyContinue)) {
+        foreach ($process in @(Get-Process -Name xray, 'xray-hysteria2' -ErrorAction SilentlyContinue)) {
             $commandLine = [EmulatorWindowNative]::ReadCommandLine($process.Id)
             if ($commandLine -and $commandLine.IndexOf(('"' + $configPath + '"'), [StringComparison]::OrdinalIgnoreCase) -ge 0) {
                 return [pscustomobject]@{ ProcessId = $process.Id }
@@ -1156,7 +1259,7 @@ function Get-XrayProcessForAvd {
 
 function Test-XrayConfig {
     param([string]$ConfigJson)
-    $xray = Get-XrayExe
+    $xray = Get-XrayExe $ConfigJson
     if (-not $xray) { throw 'Xray core is missing. Reopen AndroidSocialSuite.exe to install it.' }
     $testPath = Join-Path $env:TEMP ('android-vless-' + [Guid]::NewGuid().ToString('N') + '.json')
     try {
@@ -1199,12 +1302,12 @@ function Start-XrayForAvd {
     }
     if (Test-TcpPort $port) { throw "Local port $port is occupied by another program." }
 
-    $xray = Get-XrayExe
-    if (-not $xray) { throw 'Xray core is missing. Reopen AndroidSocialSuite.exe to install it.' }
     if (-not $configJson) {
         $vlessUri = Unprotect-Secret $binding.encryptedUri
         $configJson = New-XrayConfigJson $vlessUri $port
     }
+    $xray = Get-XrayExe $configJson
+    if (-not $xray) { throw 'Xray core is missing. Reopen AndroidSocialSuite.exe to install it.' }
     $configPath = Get-XrayConfigPath $Name
     $configDirectory = Split-Path $configPath -Parent
     [void](New-Item -ItemType Directory -Path $configDirectory -Force)
@@ -1219,7 +1322,7 @@ function Start-XrayForAvd {
     $process = [Diagnostics.Process]::Start($info)
     Start-Sleep -Milliseconds 700
     if ($process.HasExited -or -not (Test-TcpPort $port)) {
-        throw "The dedicated Xray proxy for $Name could not start. Use Set VLESS again to validate the node."
+        throw "The dedicated Xray proxy for $Name could not start. Use Set Proxy again to validate the node."
     }
     $port
 }
@@ -1399,7 +1502,7 @@ function Prompt-VlessUri {
     $dialog.MaximizeBox = $false
     $dialog.MinimizeBox = $false
     $label = [Windows.Forms.Label]::new()
-    $label.Text = 'Paste VLESS, VMess, Trojan, SS, SOCKS5, HTTP(S), or one Xray outbound JSON object.'
+    $label.Text = 'Paste Hysteria2 / hy2, VLESS, VMess, Trojan, SS, SOCKS5, HTTP(S), or Xray JSON.'
     $label.Location = [Drawing.Point]::new(18, 18)
     $label.Size = [Drawing.Size]::new(585, 36)
     $box = [Windows.Forms.TextBox]::new()
@@ -1577,6 +1680,9 @@ function Get-XrayEndpointFromConfig {
         $config = [IO.File]::ReadAllText($ConfigPath) | ConvertFrom-Json
         $outbound = @($config.outbounds | Where-Object { $_.protocol -notin @('freedom', 'blackhole') }) | Select-Object -First 1
         if (-not $outbound) { return $null }
+        if ($outbound.protocol -eq 'hysteria') {
+            return [pscustomobject]@{ Host = [string]$outbound.settings.address; Port = [int]$outbound.settings.port; Transport = 'udp' }
+        }
         if ($outbound.settings.vnext) {
             return [pscustomobject]@{ Host = [string]$outbound.settings.vnext[0].address; Port = [int]$outbound.settings.vnext[0].port }
         }
@@ -1637,7 +1743,8 @@ function Test-PhoneProxy {
         Set-Status "Testing latency and the independent exit for $name..."
         $port = Start-XrayForAvd $name
         $endpoint = Get-XrayEndpointFromConfig (Get-XrayConfigPath $name)
-        $tcpLatency = if ($endpoint) { Measure-TcpLatency $endpoint.Host $endpoint.Port } else { $null }
+        $isUdpNode = $endpoint -and $endpoint.Transport -eq 'udp'
+        $tcpLatency = if ($endpoint -and -not $isUdpNode) { Measure-TcpLatency $endpoint.Host $endpoint.Port } else { $null }
         $proxyWatch = [Diagnostics.Stopwatch]::StartNew()
         $response = Invoke-WebRequest -UseBasicParsing -Uri 'https://api.ipify.org' -Proxy ("http://127.0.0.1:$($port + 1000)") -TimeoutSec 15
         $proxyWatch.Stop()
@@ -1645,7 +1752,8 @@ function Test-PhoneProxy {
         if ($exitIp -notmatch '^[0-9a-fA-F:.]+$') { throw 'The proxy responded, but the exit IP could not be identified.' }
         $tcpText = if ($null -ne $tcpLatency) { "$tcpLatency ms" } else { 'N/A (endpoint unavailable or timed out)' }
         $proxyLatency = [Math]::Round($proxyWatch.Elapsed.TotalMilliseconds)
-        Set-PhoneLatencyResult $name "Host TCP $tcpText / HTTPS $proxyLatency ms"
+        if ($isUdpNode) { Set-PhoneLatencyResult $name "Hysteria2 UDP / HTTPS $proxyLatency ms" }
+        else { Set-PhoneLatencyResult $name "Host TCP $tcpText / HTTPS $proxyLatency ms" }
         Set-Status "${name}: host proxy OK, exit $exitIp. Android connectivity and bandwidth not tested."
     } catch {
         $reason = $_.Exception.Message

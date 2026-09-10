@@ -33,6 +33,8 @@ internal static class AndroidSocialSuiteLauncher
             ExtractResource("android-avd-manager.ps1", managerPath);
             ExtractResource("xray.exe", xrayPath);
             ExtractResource("XRAY-LICENSE.txt", xrayLicensePath);
+            ExtractResource("xray-hysteria2.exe", Path.Combine(extractionRoot, "xray-hysteria2.exe"));
+            ExtractResource("HYSTERIA2-XRAY-LICENSE.txt", Path.Combine(extractionRoot, "HYSTERIA2-XRAY-LICENSE.txt"));
             ExtractResource("zxing.dll", zxingPath);
             ExtractResource("ZXING-LICENSE.txt", zxingLicensePath);
             ExtractResource("app-icon.ico", iconPath);

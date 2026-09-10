@@ -336,6 +336,27 @@ function Install-XrayCore {
     }
 }
 
+function Install-Hysteria2Core {
+    param([string]$Root)
+    $source = Join-Path $PSScriptRoot 'xray-hysteria2.exe'
+    if (-not (Test-Path -LiteralPath $source)) { $source = Join-Path $PSScriptRoot 'vendor\xray-hysteria2\xray.exe' }
+    $destination = Join-Path $Root 'xray-hysteria2'
+    $exe = Join-Path $destination 'xray.exe'
+    if (-not (Test-Path -LiteralPath $source)) {
+        if (Test-Path -LiteralPath $exe) { return }
+        throw 'The Hysteria2 component is missing from this package. Download the full Hysteria2-enabled EXE.'
+    }
+    [void](New-Item -ItemType Directory -Path $destination -Force)
+    $needsCopy = (-not (Test-Path -LiteralPath $exe)) -or ((Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash)
+    if ($needsCopy) {
+        try { Copy-Item -LiteralPath $source -Destination $exe -Force }
+        catch { throw 'Unable to update the Hysteria2 core. Close other manager windows and stop Hysteria2 devices, then reopen this EXE.' }
+    }
+    $license = Join-Path $PSScriptRoot 'HYSTERIA2-XRAY-LICENSE.txt'
+    if (-not (Test-Path -LiteralPath $license)) { $license = Join-Path $PSScriptRoot 'vendor\xray-hysteria2\LICENSE.txt' }
+    if (Test-Path -LiteralPath $license) { Copy-Item -LiteralPath $license -Destination (Join-Path $destination 'LICENSE.txt') -Force }
+}
+
 function Install-ApplicationEntryPoints {
     param([string]$Root)
 
@@ -568,6 +589,7 @@ try {
     }
 
     Install-XrayCore $root
+    Install-Hysteria2Core $root
     Install-ApplicationEntryPoints $root
 
     $env:ANDROID_SOCIAL_HOME = $root
