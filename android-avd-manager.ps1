@@ -50,6 +50,38 @@ public static class EmulatorWindowNative {
         }
     }
 
+    [DllImport("iphlpapi.dll", SetLastError = true)]
+    private static extern uint GetExtendedTcpTable(IntPtr table, ref int size, bool sort, int family, int tableClass, uint reserved);
+
+    public static int GetListenerProcessId(int port) {
+        if (port < 1 || port > 65535) return 0;
+        int size = 0;
+        GetExtendedTcpTable(IntPtr.Zero, ref size, false, 2, 3, 0);
+        for (int attempt = 0; attempt < 3; attempt++) {
+            if (size < 4 || size > 16777216) return 0;
+            int allocated = size;
+            IntPtr table = Marshal.AllocHGlobal(allocated);
+            try {
+                uint result = GetExtendedTcpTable(table, ref size, false, 2, 3, 0);
+                if (result == 122) continue;
+                if (result != 0) return 0;
+                int rows = Marshal.ReadInt32(table);
+                if (rows < 0 || rows > (allocated - 4) / 24) return 0;
+                int owner = 0;
+                for (int row = 0; row < rows; row++) {
+                    int offset = 4 + row * 24;
+                    int localPort = (Marshal.ReadByte(table, offset + 8) << 8) | Marshal.ReadByte(table, offset + 9);
+                    if (localPort != port) continue;
+                    int candidate = Marshal.ReadInt32(table, offset + 20);
+                    if (candidate <= 0 || (owner != 0 && candidate != owner)) return 0;
+                    owner = candidate;
+                }
+                return owner;
+            } finally { Marshal.FreeHGlobal(table); }
+        }
+        return 0;
+    }
+
     public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
     [StructLayout(LayoutKind.Sequential)]
@@ -529,6 +561,30 @@ function Get-ManagerOwnerTag {
         finally { $hash.Dispose() }
     }
     $script:ManagerOwnerTag
+}
+
+function Test-HostDeviceOwner {
+    param([string]$Serial, [string]$Name, [string]$OwnerTag)
+    # Some Android images do not publish arbitrary emulator -prop values.
+    # Match the ADB serial's console listener, executable, AVD, and root tag.
+    if ($Serial -notmatch '^emulator-(\d{1,5})$' -or $OwnerTag -notmatch '^[0-9a-f]{32}$') { return $false }
+    $consolePort = [int]($Serial.Substring('emulator-'.Length))
+    $process = $null
+    try {
+        $ownerId = [EmulatorWindowNative]::GetListenerProcessId($consolePort)
+        if ($ownerId -le 0) { return $false }
+        $process = Get-Process -Id $ownerId -ErrorAction Stop
+        $allowedPaths = @(
+            (Join-Path $script:SdkRoot 'emulator\qemu\windows-x86_64\qemu-system-x86_64.exe'),
+            (Join-Path $script:SdkRoot 'emulator\emulator.exe')
+        )
+        if ($process.Path -notin $allowedPaths) { return $false }
+        $commandLine = [EmulatorWindowNative]::ReadCommandLine($ownerId)
+        if ($commandLine -notmatch '(?:^|\s)-avd\s+"?([A-Za-z0-9_-]+)"?(?=\s|$)' -or $Matches[1] -cne $Name) { return $false }
+        if ($commandLine -notmatch '(?:^|\s)-prop\s+"?qemu\.social_owner=([0-9a-f]{32})"?(?=\s|$)' -or $Matches[1] -cne $OwnerTag) { return $false }
+        return (-not $process.HasExited -and [EmulatorWindowNative]::GetListenerProcessId($consolePort) -eq $ownerId)
+    } catch { return $false }
+    finally { if ($process) { $process.Dispose() } }
 }
 
 function Get-ScaledDisplayProfile {
@@ -2299,11 +2355,12 @@ function Initialize-RunningDevices {
             $serial = $Matches[1]
             try {
                 $identity = @(Invoke-OwnedAdb -s $serial shell 'getprop ro.boot.qemu.avd_name; getprop sys.boot_completed; cat /proc/sys/kernel/random/boot_id; getprop qemu.social_owner')
-                if ($LASTEXITCODE -ne 0 -or $identity.Count -lt 4) { continue }
+                if ($LASTEXITCODE -ne 0 -or $identity.Count -lt 3) { continue }
                 $name = $identity[0].Trim()
                 if ($name -notmatch '^[A-Za-z0-9_-]+$' -or $name -eq $script:TemplateName -or $identity[1].Trim() -ne '1') { continue }
                 if (-not $managedNames.ContainsKey($name)) { continue }
-                if ($identity[3].Trim() -cne $ownerTag) {
+                $deviceOwner = if ($identity.Count -ge 4) { $identity[3].Trim() } else { '' }
+                if ($deviceOwner -cne $ownerTag -and ($deviceOwner -or -not (Test-HostDeviceOwner $serial $name $ownerTag))) {
                     Set-Status "$name background maintenance skipped: restart it from this manager to confirm ownership."
                     continue
                 }
