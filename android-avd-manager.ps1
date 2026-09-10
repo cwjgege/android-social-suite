@@ -3,7 +3,10 @@ param(
     [string]$CapturePreview,
     [switch]$Maintenance,
     [string]$SnapshotPath,
-    [switch]$MeasureLatency
+    [switch]$MeasureLatency,
+    [string]$AdbJobName,
+    [int]$OwnerPid = 0,
+    [long]$OwnerStartTicks = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -88,6 +91,262 @@ public static class EmulatorWindowNative {
         return result;
     }
 }
+
+public sealed class OwnedAdbJob : IDisposable {
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BasicLimits {
+        public long PerProcessUserTimeLimit, PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize, MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass, SchedulingClass;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IoCounters {
+        public ulong ReadOperationCount, WriteOperationCount, OtherOperationCount;
+        public ulong ReadTransferCount, WriteTransferCount, OtherTransferCount;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ExtendedLimits {
+        public BasicLimits BasicLimitInformation;
+        public IoCounters IoInfo;
+        public UIntPtr ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed;
+    }
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    private static extern IntPtr CreateJobObject(IntPtr attributes, string name);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    private static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref ExtendedLimits info, uint length);
+    [DllImport("kernel32.dll")]
+    private static extern bool CloseHandle(IntPtr handle);
+    private IntPtr handle;
+    public OwnedAdbJob(string name) {
+        handle=CreateJobObject(IntPtr.Zero,name);
+        if(handle==IntPtr.Zero) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        // Kill explicitly assigned clients only. Children, including the shared
+        // ADB server, are permitted to leave this job automatically.
+        ExtendedLimits limits=new ExtendedLimits();
+        limits.BasicLimitInformation.LimitFlags=0x2000 | 0x1000;
+        if(!SetInformationJobObject(handle,9,ref limits,(uint)Marshal.SizeOf(typeof(ExtendedLimits)))) {
+            int error=Marshal.GetLastWin32Error(); Dispose();
+            throw new System.ComponentModel.Win32Exception(error);
+        }
+    }
+    public void Dispose() { if(handle!=IntPtr.Zero) { CloseHandle(handle);handle=IntPtr.Zero; } }
+    private static string Quote(string value) {
+        StringBuilder result=new StringBuilder("\""); int slashes=0;
+        foreach(char c in value) {
+            if(c=='\\') { slashes++; continue; }
+            if(c=='\"') { result.Append('\\',slashes*2+1);result.Append(c);slashes=0;continue; }
+            result.Append('\\',slashes);slashes=0;result.Append(c);
+        }
+        result.Append('\\',slashes*2);result.Append('"');return result.ToString();
+    }
+    private static bool OwnerAlive(int pid, long ticks) {
+        if(pid<=0) return true;
+        try { using(System.Diagnostics.Process p=System.Diagnostics.Process.GetProcessById(pid)) {
+            return !p.HasExited && p.StartTime.ToUniversalTime().Ticks==ticks;
+        }} catch { return false; }
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+    private struct StartupInfo {
+        public int cb;
+        public string reserved, desktop, title;
+        public uint x, y, xSize, ySize, xCountChars, yCountChars, fillAttribute, flags;
+        public ushort showWindow, reservedSize;
+        public IntPtr reservedBytes, standardInput, standardOutput, standardError;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct StartupInfoEx { public StartupInfo startup; public IntPtr attributes; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ProcessInformation { public IntPtr process, thread; public uint processId, threadId; }
+    [DllImport("kernel32.dll", SetLastError=true)]
+    private static extern bool InitializeProcThreadAttributeList(IntPtr list, int count, int flags, ref IntPtr size);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    private static extern bool UpdateProcThreadAttribute(IntPtr list, uint flags, IntPtr attribute, IntPtr value, IntPtr size, IntPtr previous, IntPtr returnedSize);
+    [DllImport("kernel32.dll")]
+    private static extern void DeleteProcThreadAttributeList(IntPtr list);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true, EntryPoint="CreateProcessW")]
+    private static extern bool CreateProcess(string application, StringBuilder commandLine, IntPtr processAttributes, IntPtr threadAttributes, bool inheritHandles, uint flags, IntPtr environment, string directory, ref StartupInfoEx startup, out ProcessInformation process);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    private static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    private static extern bool TerminateProcess(IntPtr process, uint exitCode);
+
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JobAccounting {
+        public long TotalUserTime, TotalKernelTime, PeriodUserTime, PeriodKernelTime;
+        public uint TotalPageFaults, TotalProcesses, ActiveProcesses, TotalTerminatedProcesses;
+    }
+    [DllImport("kernel32.dll", SetLastError=true)]
+    private static extern bool QueryInformationJobObject(IntPtr job, int infoClass, out JobAccounting info, uint length, IntPtr returnedLength);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    private static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+    public string LastCleanupError { get; private set; }
+    private uint ActiveClients() {
+        JobAccounting info;
+        if(!QueryInformationJobObject(handle,1,out info,(uint)Marshal.SizeOf(typeof(JobAccounting)),IntPtr.Zero)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        return info.ActiveProcesses;
+    }
+    public bool StopClients(int timeoutMs) {
+        LastCleanupError="";
+        if(handle==IntPtr.Zero) return true;
+        try {
+            if(ActiveClients()==0) return true;
+            bool requested=TerminateJobObject(handle,1);
+            int error=requested ? 0 : Marshal.GetLastWin32Error();
+            if(!requested) {
+                if(ActiveClients()==0) return true; // Exit raced with termination.
+                LastCleanupError="Job termination failed (Win32 "+error+").";
+                return false;
+            }
+            var watch=System.Diagnostics.Stopwatch.StartNew();
+            while(ActiveClients()!=0) {
+                if(watch.ElapsedMilliseconds>=timeoutMs) {
+                    LastCleanupError="Owned ADB clients have not exited; cleanup remains pending.";
+                    return false;
+                }
+                System.Threading.Thread.Sleep(20);
+            }
+            return true;
+        } catch(Exception exception) {
+            LastCleanupError="Cannot confirm ADB cleanup: "+exception.Message;
+            return false;
+        }
+    }
+    private static string ConfirmProcessExit(IntPtr process, int timeoutMs) {
+        uint state=WaitForSingleObject(process,0);
+        if(state==0) return null;
+        if(state!=0x102) return "Process exit check failed (Win32 "+Marshal.GetLastWin32Error()+").";
+        bool requested=TerminateProcess(process,1);
+        int error=requested ? 0 : Marshal.GetLastWin32Error();
+        state=WaitForSingleObject(process,(uint)timeoutMs);
+        if(state==0) return null; // Also handles a normal exit racing with termination.
+        if(state!=0x102) return "Process exit wait failed (Win32 "+Marshal.GetLastWin32Error()+").";
+        return requested ? "ADB termination was requested but exit is still pending." : "ADB termination failed (Win32 "+error+"); exit is still pending.";
+    }
+
+    public OwnedAdbResult Run(string file, string[] args, int timeoutMs, int ownerPid, long ownerTicks) {
+        if(!OwnerAlive(ownerPid,ownerTicks)) throw new OperationCanceledException("Manager closed.");
+        if(handle==IntPtr.Zero) throw new ObjectDisposedException("OwnedAdbJob");
+        if(!StopClients(2000)) throw new InvalidOperationException(LastCleanupError+" No new ADB client was started.");
+        StringBuilder command=new StringBuilder(Quote(file));
+        foreach(string arg in args) command.Append(' ').Append(Quote(arg));
+        using(var input=new System.IO.Pipes.AnonymousPipeServerStream(System.IO.Pipes.PipeDirection.Out,System.IO.HandleInheritability.Inheritable))
+        using(var outputPipe=new System.IO.Pipes.AnonymousPipeServerStream(System.IO.Pipes.PipeDirection.In,System.IO.HandleInheritability.Inheritable))
+        using(var errorPipe=new System.IO.Pipes.AnonymousPipeServerStream(System.IO.Pipes.PipeDirection.In,System.IO.HandleInheritability.Inheritable)) {
+            StartupInfoEx startup=new StartupInfoEx();
+            startup.startup.cb=Marshal.SizeOf(typeof(StartupInfoEx));
+            startup.startup.flags=0x100; // STARTF_USESTDHANDLES
+            var inputClient=input.ClientSafePipeHandle;
+            var outputClient=outputPipe.ClientSafePipeHandle;
+            var errorClient=errorPipe.ClientSafePipeHandle;
+            startup.startup.standardInput=inputClient.DangerousGetHandle();
+            startup.startup.standardOutput=outputClient.DangerousGetHandle();
+            startup.startup.standardError=errorClient.DangerousGetHandle();
+            IntPtr listSize=IntPtr.Zero, jobValue=IntPtr.Zero, inherited=IntPtr.Zero;
+            bool initialized=false;
+            ProcessInformation process=new ProcessInformation();
+            Exception commandFailure=null;
+            string cleanupFailure=null;
+            try {
+                InitializeProcThreadAttributeList(IntPtr.Zero,2,0,ref listSize);
+                if(listSize==IntPtr.Zero) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+                startup.attributes=Marshal.AllocHGlobal(listSize);
+                if(!InitializeProcThreadAttributeList(startup.attributes,2,0,ref listSize)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+                initialized=true;
+                jobValue=Marshal.AllocHGlobal(IntPtr.Size);
+                Marshal.WriteIntPtr(jobValue,handle);
+                // Assign before any child code runs. Never fall back to an unowned launch.
+                if(!UpdateProcThreadAttribute(startup.attributes,0,new IntPtr(0x2000d),jobValue,new IntPtr(IntPtr.Size),IntPtr.Zero,IntPtr.Zero)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+                inherited=Marshal.AllocHGlobal(3*IntPtr.Size);
+                Marshal.WriteIntPtr(inherited,0,startup.startup.standardInput);
+                Marshal.WriteIntPtr(inherited,IntPtr.Size,startup.startup.standardOutput);
+                Marshal.WriteIntPtr(inherited,2*IntPtr.Size,startup.startup.standardError);
+                if(!UpdateProcThreadAttribute(startup.attributes,0,new IntPtr(0x20002),inherited,new IntPtr(3*IntPtr.Size),IntPtr.Zero,IntPtr.Zero)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+                if(!OwnerAlive(ownerPid,ownerTicks)) throw new OperationCanceledException("Manager closed.");
+                if(!CreateProcess(file,command,IntPtr.Zero,IntPtr.Zero,true,0x08080000,IntPtr.Zero,null,ref startup,out process)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+                CloseHandle(process.thread); process.thread=IntPtr.Zero;
+                input.DisposeLocalCopyOfClientHandle();
+                outputPipe.DisposeLocalCopyOfClientHandle();
+                errorPipe.DisposeLocalCopyOfClientHandle();
+                input.Dispose(); // ADB is non-interactive: provide EOF on stdin.
+                using(var output=new System.IO.StreamReader(outputPipe,System.Text.Encoding.UTF8))
+                using(var error=new System.IO.StreamReader(errorPipe,System.Text.Encoding.UTF8)) {
+                    var outputTask=output.ReadToEndAsync();
+                    var errorTask=error.ReadToEndAsync();
+                    var watch=System.Diagnostics.Stopwatch.StartNew();
+                    try {
+                        while(true) {
+                            uint state=WaitForSingleObject(process.process,100);
+                            if(state==0) break;
+                            if(state!=0x102) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+                            if(!OwnerAlive(ownerPid,ownerTicks)) throw new OperationCanceledException("Manager closed.");
+                            if(watch.ElapsedMilliseconds>=timeoutMs) throw new TimeoutException("ADB command timed out after "+(timeoutMs/1000)+" seconds.");
+                        }
+                        if(!System.Threading.Tasks.Task.WaitAll(new System.Threading.Tasks.Task[]{outputTask,errorTask},2000)) throw new TimeoutException("ADB output did not close.");
+                        uint exitCode;
+                        if(!GetExitCodeProcess(process.process,out exitCode)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+                        return new OwnedAdbResult { ExitCode=unchecked((int)exitCode), Output=outputTask.Result, Error=errorTask.Result };
+                    } finally {
+                        // Terminate before disposing redirected streams, including timeout paths.
+                        cleanupFailure=ConfirmProcessExit(process.process,2000);
+                    }
+                }
+            } catch(Exception exception) {
+                commandFailure=exception;
+                throw;
+            } finally {
+                // Exposed client handles are not owned by the outer pipe Dispose.
+                // SafeHandle.Dispose is idempotent after the successful-launch cleanup.
+                inputClient.Dispose();
+                outputClient.Dispose();
+                errorClient.Dispose();
+                if(process.thread!=IntPtr.Zero) CloseHandle(process.thread);
+                if(process.process!=IntPtr.Zero) {
+                    cleanupFailure=ConfirmProcessExit(process.process,2000);
+                    // The job retains ownership even after this handle is closed.
+                    // Run refuses to create another client while that job is non-empty.
+                    CloseHandle(process.process);
+                }
+                if(initialized) DeleteProcThreadAttributeList(startup.attributes);
+                if(startup.attributes!=IntPtr.Zero) Marshal.FreeHGlobal(startup.attributes);
+                if(jobValue!=IntPtr.Zero) Marshal.FreeHGlobal(jobValue);
+                if(inherited!=IntPtr.Zero) Marshal.FreeHGlobal(inherited);
+                if(cleanupFailure!=null) {
+                    LastCleanupError=cleanupFailure;
+                    throw new InvalidOperationException(cleanupFailure+" The client remains owned by its job; new commands are blocked until cleanup completes.",commandFailure);
+                }
+            }
+        }
+    }
+}
+
+public static class HostResourceNative {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MemoryStatus {
+        public uint Length, Load;
+        public ulong TotalPhysical, AvailablePhysical, TotalPageFile, AvailablePageFile, TotalVirtual, AvailableVirtual, AvailableExtendedVirtual;
+    }
+    [DllImport("kernel32.dll", SetLastError=true)]
+    private static extern bool GlobalMemoryStatusEx(ref MemoryStatus status);
+    public static MemoryStatus GetMemory() {
+        MemoryStatus status=new MemoryStatus();
+        status.Length=(uint)Marshal.SizeOf(typeof(MemoryStatus));
+        if(!GlobalMemoryStatusEx(ref status)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        return status;
+    }
+}
+
+public sealed class OwnedAdbResult {
+    public int ExitCode;
+    public string Output, Error;
+}
+
 '@
 }
 
@@ -132,7 +391,13 @@ $script:TemplateName = 'social_template'
 $script:SharedProxyPort = 10808
 $script:ProxyPortStart = 18081
 $script:ProxyPortEnd = 18180
-$script:RecommendedRunning = 2
+$script:RuntimePolicy = [ordered]@{
+    'hw.gpu.enabled' = 'yes'
+    'hw.gpu.mode' = 'host'
+    'fastboot.forceColdBoot' = 'yes'
+    'fastboot.forceFastBoot' = 'no'
+    'fastboot.forceChosenSnapshotBoot' = 'no'
+}
 $script:ProfileRoot = Join-Path $script:BaseRoot 'proxy-profiles'
 $script:RuntimeRoot = Join-Path $script:BaseRoot 'proxy-runtime'
 $script:BindingsFile = Join-Path $script:ProfileRoot 'bindings.json'
@@ -160,6 +425,41 @@ $env:ADB_VENDOR_KEYS = $script:AdbKey
 foreach ($directory in @($script:EmulatorHome, $script:ProfileRoot, $script:RuntimeRoot)) {
     if (-not (Test-Path -LiteralPath $directory)) {
         [void](New-Item -ItemType Directory -Path $directory -Force)
+    }
+}
+
+function Invoke-OwnedAdb {
+    $arguments = [string[]]@($args)
+    if (-not $script:OwnedAdbJob) {
+        $jobName = if ($Maintenance -and $AdbJobName) { $AdbJobName } else { 'Local\AndroidSocialAdb-' + [Guid]::NewGuid().ToString('N') }
+        $script:OwnedAdbJob = [OwnedAdbJob]::new($jobName)
+    }
+    $timeout = if ($arguments -contains 'install' -or $arguments -contains 'push') { 120000 } else { 12000 }
+    $result = $script:OwnedAdbJob.Run($script:AdbExe, $arguments, $timeout, $OwnerPid, $OwnerStartTicks)
+    $global:LASTEXITCODE = $result.ExitCode
+    $text = $result.Output
+    if ($result.ExitCode -ne 0 -and $result.Error) { $text += $result.Error }
+    if ($text) { $text.TrimEnd() -split '\r?\n' }
+}
+
+function Stop-BackgroundMaintenance {
+    if ($script:MaintenanceProcess) {
+        if (-not $script:MaintenanceProcess.HasExited) {
+            $script:MaintenanceProcess.Kill()
+            if (-not $script:MaintenanceProcess.WaitForExit(2000)) { throw 'Background task has not exited; no replacement task will be started.' }
+        }
+        $script:MaintenanceProcess.Dispose()
+        $script:MaintenanceProcess = $null
+    }
+    if ($script:SnapshotFile -and (Test-Path -LiteralPath $script:SnapshotFile)) {
+        try { [IO.File]::Delete($script:SnapshotFile) } catch { }
+    }
+    if ($script:BackgroundAdbJob) {
+        if (-not $script:BackgroundAdbJob.StopClients(2000)) {
+            throw ($script:BackgroundAdbJob.LastCleanupError + ' The existing job is retained; no replacement task will be started.')
+        }
+        $script:BackgroundAdbJob.Dispose()
+        $script:BackgroundAdbJob = $null
     }
 }
 
@@ -205,6 +505,108 @@ function Get-AvdNames {
         ForEach-Object { $_.BaseName } |
         Where-Object { $_ -ne $script:TemplateName } |
         Sort-Object)
+}
+
+
+function Get-ManagerOwnerTag {
+    if (-not $script:ManagerOwnerTag) {
+        $identity = [IO.Path]::GetFullPath($script:AvdRoot).TrimEnd('\').ToLowerInvariant()
+        $hash = [Security.Cryptography.SHA256]::Create()
+        try { $script:ManagerOwnerTag = ([BitConverter]::ToString($hash.ComputeHash([Text.Encoding]::UTF8.GetBytes($identity)))).Replace('-', '').Substring(0, 32).ToLowerInvariant() }
+        finally { $hash.Dispose() }
+    }
+    $script:ManagerOwnerTag
+}
+
+function Get-ScaledDisplayProfile {
+    param($Profile, [int]$ShortEdge = 0)
+    $width = [int]$Profile.Width
+    $height = [int]$Profile.Height
+    $density = [int]$Profile.Density
+    if ($width -le 0 -or $height -le 0 -or $density -le 0 -or $ShortEdge -lt 0) { throw 'Invalid display profile.' }
+    $scale = if ($ShortEdge -eq 0) { 1.0 } else { [Math]::Min(1.0, $ShortEdge / [double][Math]::Min($width, $height)) }
+    [pscustomobject]@{
+        Width = $(if ($scale -eq 1.0) { $width } else { [Math]::Max(2, [int]([Math]::Round($width * $scale / 2) * 2)) })
+        Height = $(if ($scale -eq 1.0) { $height } else { [Math]::Max(2, [int]([Math]::Round($height * $scale / 2) * 2)) })
+        Density = [Math]::Max(120, [int][Math]::Round($density * $scale))
+    }
+}
+
+function Get-PhoneResourceProfile {
+    param([string]$Name)
+    $config = [IO.File]::ReadAllText((Join-Path $script:AvdRoot ($Name + '.avd\config.ini')))
+    $ram = 1536.0
+    $cores = 2
+    $estimated = $false
+    if ($config -match '(?m)^hw\.ramSize\s*=\s*(\d+)\s*([MG]?)\s*$') {
+        $ram = [double]$Matches[1]
+        if ($Matches[2] -eq 'G') { $ram *= 1024 }
+    } else { $estimated = $true }
+    if ($config -match '(?m)^hw\.cpu\.ncore\s*=\s*(\d+)\s*$') { $cores = [int]$Matches[1] } else { $estimated = $true }
+    if ($ram -le 0 -or $cores -le 0) { throw "Invalid resource settings for $Name." }
+    [pscustomobject]@{ Name=$Name; RamMb=$ram; Cores=$cores; Estimated=$estimated }
+}
+
+function Confirm-PhoneResourceBudget {
+    param([string]$Name, [hashtable]$Running)
+    $warnings = [Collections.Generic.List[string]]::new()
+    $candidate = Get-PhoneResourceProfile $Name
+    $ramMb = $candidate.RamMb
+    $cores = $candidate.Cores
+    $count = 1
+    foreach ($existing in Get-AvdNames) {
+        if ($existing -eq $Name -or -not $Running.ContainsKey($existing)) { continue }
+        $profile = Get-PhoneResourceProfile $existing
+        $ramMb += $profile.RamMb
+        $cores += $profile.Cores
+        $count++
+        if ($profile.Estimated) { $warnings.Add("$existing has incomplete resource settings; its budget is estimated.") }
+    }
+    if ($candidate.Estimated) { $warnings.Add('The selected phone has incomplete resource settings; its budget is estimated.') }
+    try {
+        $memory = [HostResourceNative]::GetMemory()
+        $totalMb = $memory.TotalPhysical / 1MB
+        $availableMb = $memory.AvailablePhysical / 1MB
+        $reserveMb = [Math]::Max(3072, $totalMb * 0.20)
+        $deviceOverheadMb = 1024
+        if ($ramMb + $count * $deviceOverheadMb + $reserveMb -gt $totalMb) {
+            $warnings.Add(('Configured guest RAM ({0:N1} GB), estimated emulator overhead and Windows reserve exceed {1:N1} GB of physical RAM.' -f ($ramMb/1024), ($totalMb/1024)))
+        }
+        if ($candidate.RamMb + $deviceOverheadMb + 2048 -gt $availableMb) {
+            $warnings.Add(('Only {0:N1} GB is currently available; starting this {1:N1} GB phone may cause paging.' -f ($availableMb/1024), ($candidate.RamMb/1024)))
+        }
+    } catch { $warnings.Add('Available Windows memory could not be read. Check Task Manager before starting another phone.') }
+    $logicalCores = [Environment]::ProcessorCount
+    if ($cores -gt [Math]::Max(1, $logicalCores - 2)) {
+        $warnings.Add("These phones request $cores vCPUs on a host with $logicalCores logical processors; simultaneous load may cause contention.")
+    }
+    if ($warnings.Count -eq 0) { return $true }
+    $message = ($warnings -join "\n\n").Replace('\n', [Environment]::NewLine) + [Environment]::NewLine + [Environment]::NewLine + 'These are conservative estimates, not reserved RAM or CPU. Existing settings will not be changed. Start anyway?'
+    $answer = [Windows.Forms.MessageBox]::Show($script:Form, $message, 'Resource budget warning', [Windows.Forms.MessageBoxButtons]::YesNo, [Windows.Forms.MessageBoxIcon]::Warning, [Windows.Forms.MessageBoxDefaultButton]::Button2)
+    return $answer -eq [Windows.Forms.DialogResult]::Yes
+}
+
+function Set-PhoneRuntimePolicy {
+    param([string]$Name)
+    if ((Get-RunningAvds).ContainsKey($Name)) { throw 'The phone is already running. Runtime settings were not changed.' }
+    $dir = Join-Path $script:AvdRoot ($Name + '.avd')
+    $path = Join-Path $dir 'config.ini'
+    $original = [IO.File]::ReadAllText($path)
+    $config = $original
+    foreach ($entry in $script:RuntimePolicy.GetEnumerator()) {
+        $pattern = '(?m)^' + [Regex]::Escape($entry.Key) + '\s*=.*$'
+        $line = $entry.Key + ' = ' + $entry.Value
+        if ($config -match $pattern) { $config = $config -replace $pattern, $line }
+        else { $config = $config.TrimEnd() + [Environment]::NewLine + $line + [Environment]::NewLine }
+    }
+    if ($config -ceq $original) { return }
+    $temp = Join-Path $dir ('runtime-policy-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        [IO.File]::WriteAllText($temp, $config, [Text.UTF8Encoding]::new($false))
+        if ((Get-RunningAvds).ContainsKey($Name)) { throw 'The phone started while its settings were being prepared.' }
+        if ([IO.File]::ReadAllText($path) -cne $original) { throw 'Configuration changed. Retry without editing it concurrently.' }
+        [IO.File]::Replace($temp, $path, (Join-Path $dir 'config.ini.before-runtime-policy.bak'))
+    } finally { if (Test-Path -LiteralPath $temp) { [IO.File]::Delete($temp) } }
 }
 
 function Get-AvdProcesses {
@@ -837,10 +1239,12 @@ function Stop-XrayForAvd {
 
 function Clear-AndroidSystemProxy {
     param([string]$Serial)
-    & $script:AdbExe -s $Serial shell settings put global http_proxy ':0' 2>$null | Out-Null
+    $commands = @('settings put global http_proxy :0')
     foreach ($key in @('http_proxy', 'global_http_proxy_host', 'global_http_proxy_port', 'global_http_proxy_exclusion_list', 'global_proxy_pac_url', 'proxy_pac_url')) {
-        & $script:AdbExe -s $Serial shell settings delete global $key 2>$null | Out-Null
+        $commands += "settings delete global $key"
     }
+    Invoke-OwnedAdb -s $Serial shell ($commands -join ' && ') | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Unable to clear the legacy Android proxy settings.' }
 }
 
 function Invoke-DeviceTunnelControl {
@@ -853,7 +1257,7 @@ function Invoke-DeviceTunnelControl {
     if ($Action -eq 'CONNECT') {
         $arguments += @('--es', 'socks_host', '127.0.0.1', '--ei', 'socks_port', [string]$Port)
     }
-    (& $script:AdbExe @arguments 2>&1 | Out-String).Trim()
+    (Invoke-OwnedAdb @arguments 2>&1 | Out-String).Trim()
 }
 
 function Ensure-DeviceTunnel {
@@ -862,23 +1266,23 @@ function Ensure-DeviceTunnel {
         throw 'The embedded Android VPN component is missing. Reinstall Android Social Suite.'
     }
 
-    $packageInfo = (& $script:AdbExe -s $Serial shell dumpsys package $script:TunnelPackage 2>$null | Out-String)
+    $packageInfo = (Invoke-OwnedAdb -s $Serial shell dumpsys package $script:TunnelPackage 2>$null | Out-String)
     $installedVersion = 0
     if ($packageInfo -match '\bversionCode=(\d+)\b') { $installedVersion = [int]$Matches[1] }
     if ($installedVersion -lt $script:TunnelVersionCode) {
         Set-Status "Installing the managed VPN component on $Name..."
-        $installOutput = (& $script:AdbExe -s $Serial install -r -g $script:TunnelApk 2>&1 | Out-String)
+        $installOutput = (Invoke-OwnedAdb -s $Serial install -r -g $script:TunnelApk 2>&1 | Out-String)
         if ($LASTEXITCODE -ne 0 -or $installOutput -notmatch 'Success') {
             throw "VPN upgrade failed; existing component preserved: $($installOutput.Trim())"
         }
     }
 
-    & $script:AdbExe -s $Serial shell appops set $script:TunnelPackage ACTIVATE_VPN allow 2>$null | Out-Null
+    Invoke-OwnedAdb -s $Serial shell appops set $script:TunnelPackage ACTIVATE_VPN allow 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Unable to authorize the Android VPN service.' }
     Clear-AndroidSystemProxy $Serial
-    $reverseList = (& $script:AdbExe -s $Serial reverse --list 2>$null | Out-String)
+    $reverseList = (Invoke-OwnedAdb -s $Serial reverse --list 2>$null | Out-String)
     if ($reverseList -notmatch ('(?m)\btcp:' + $Port + '\s+tcp:' + $Port + '\s*$')) {
-        & $script:AdbExe -s $Serial reverse "tcp:$Port" "tcp:$Port" 2>$null | Out-Null
+        Invoke-OwnedAdb -s $Serial reverse "tcp:$Port" "tcp:$Port" 2>$null | Out-Null
         if ($LASTEXITCODE -ne 0) { throw 'Unable to create the private ADB tunnel to Xray.' }
     }
     $currentStatus = Invoke-DeviceTunnelControl $Serial STATUS
@@ -895,7 +1299,7 @@ function Stop-DeviceTunnel {
     param([string]$Serial)
     if (-not $Serial) { return }
     [void](Invoke-DeviceTunnelControl $Serial DISCONNECT)
-    & $script:AdbExe -s $Serial reverse --remove-all 2>$null | Out-Null
+    Invoke-OwnedAdb -s $Serial reverse --remove-all 2>$null | Out-Null
     Clear-AndroidSystemProxy $Serial
 }
 
@@ -951,7 +1355,8 @@ function Update-AvdList {
         }
         $script:AvdList.Invalidate()
     }
-    $summary = '{0} device(s)    {1} running    Recommended concurrent limit: {2}' -f $script:AvdList.Items.Count, $running.Count, $script:RecommendedRunning
+    $managedRunningCount = @((Get-AvdNames) | Where-Object { $running.ContainsKey($_) }).Count
+    $summary = '{0} device(s)    {1} running    Resource budget checked on Start' -f $script:AvdList.Items.Count, $managedRunningCount
     if ($script:SummaryLabel.Text -ne $summary) { $script:SummaryLabel.Text = $summary }
     Sync-ActionStates
 }
@@ -1337,10 +1742,10 @@ function Prompt-NewPhoneDetails {
     $presetBox.Location = [Drawing.Point]::new(20, 300)
     $presetBox.Size = [Drawing.Size]::new(450, 28)
     $presetBox.DropDownStyle = [Windows.Forms.ComboBoxStyle]::DropDownList
-    [void]$presetBox.Items.Add('Social smooth - 4 GB / 4 cores / 720 x 1560')
+    [void]$presetBox.Items.Add('Social smooth - 4 GB / 4 cores / 720 short edge')
     [void]$presetBox.Items.Add('Custom - selected model resolution')
     $presetHint = [Windows.Forms.Label]::new()
-    $presetHint.Text = 'Smooth mode reduces sharpness and needs more host RAM.\nExisting phones are unchanged; performance is not guaranteed.'.Replace('\n', "`r`n")
+    $presetHint.Text = 'Smooth mode preserves screen shape and adjusts density.\nExisting phones are unchanged; resource budget is checked on Start.'.Replace('\n', "`r`n")
     $presetHint.Location = [Drawing.Point]::new(20, 337)
     $presetHint.Size = [Drawing.Size]::new(450, 42)
     $presetBox.Add_SelectedIndexChanged({
@@ -1404,7 +1809,7 @@ function Import-MediaFiles {
     }
 
     $remoteDirectory = '/sdcard/DCIM/AndroidSocialSuite'
-    & $script:AdbExe -s $serial shell mkdir -p $remoteDirectory | Out-Null
+    Invoke-OwnedAdb -s $serial shell mkdir -p $remoteDirectory | Out-Null
     if ($LASTEXITCODE -ne 0) { Show-Message 'Could not create the phone media folder.' 'Import failed' ([Windows.Forms.MessageBoxIcon]::Error); return }
 
     $imported = 0
@@ -1419,9 +1824,9 @@ function Import-MediaFiles {
         $remoteName = '{0}-{1:D2}-{2}{3}' -f $stamp, $index, $baseName, $extension
         $remotePath = "$remoteDirectory/$remoteName"
         Set-Status ("Importing {0} of {1} into {2}..." -f $index, $mediaFiles.Count, $name)
-        & $script:AdbExe -s $serial push $file $remotePath | Out-Null
+        Invoke-OwnedAdb -s $serial push $file $remotePath | Out-Null
         if ($LASTEXITCODE -ne 0) { $failed.Add([IO.Path]::GetFileName($file)); continue }
-        & $script:AdbExe -s $serial shell am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d ("file://$remotePath") | Out-Null
+        Invoke-OwnedAdb -s $serial shell am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d ("file://$remotePath") | Out-Null
         if ($LASTEXITCODE -eq 0) { $imported++ } else { $failed.Add([IO.Path]::GetFileName($file)) }
     }
 
@@ -1461,7 +1866,7 @@ function Install-ApkFiles {
         $index++
         $apkName = [IO.Path]::GetFileName($apk)
         Set-Status ("Installing APK {0} of {1} on {2}: {3}" -f $index, $apkFiles.Count, $name, $apkName)
-        $output = & $script:AdbExe -s $serial install -r $apk 2>&1
+        $output = Invoke-OwnedAdb -s $serial install -r $apk 2>&1
         if ($LASTEXITCODE -eq 0 -and (($output | Out-String) -match 'Success')) {
             $installed++
         } else {
@@ -1536,10 +1941,10 @@ function Set-PhoneResolution {
         $box.DropDownStyle = 'DropDownList'
         $box.DisplayMember = 'Label'
         foreach ($preset in @(@{Name='Smooth';Edge=720}, @{Name='Balanced';Edge=900}, @{Name='HD';Edge=1080}, @{Name='Original profile';Edge=0})) {
-            $scale = if ($preset.Edge -eq 0) { 1.0 } else { [Math]::Min(1.0, $preset.Edge / [double][Math]::Min($original.Width, $original.Height)) }
-            $w = if ($scale -eq 1.0) { [int]$original.Width } else { [int]([Math]::Round($original.Width * $scale / 2) * 2) }
-            $h = if ($scale -eq 1.0) { [int]$original.Height } else { [int]([Math]::Round($original.Height * $scale / 2) * 2) }
-            $dpi = [Math]::Max(120, [int][Math]::Round($original.Density * $scale))
+            $display = Get-ScaledDisplayProfile $original $preset.Edge
+            $w = $display.Width
+            $h = $display.Height
+            $dpi = $display.Density
             [void]$box.Items.Add([pscustomobject]@{Label="$($preset.Name) - $w x $h ($dpi dpi)";Width=$w;Height=$h;Density=$dpi})
         }
         $box.SelectedIndex = 0
@@ -1591,15 +1996,16 @@ function Set-PhoneResolution {
 
 function Set-PhonePerformanceConfig {
     param([string]$Config, $Details)
+    $edge = if ($Details.Smooth) { 720 } else { 0 }
+    $display = Get-ScaledDisplayProfile $Details.Profile $edge
     $values = [ordered]@{
         'hw.ramSize' = $Details.Ram
         'hw.cpu.ncore' = $Details.Cores
-        'hw.lcd.width' = $(if ($Details.Smooth) { 720 } else { $Details.Profile.Width })
-        'hw.lcd.height' = $(if ($Details.Smooth) { 1560 } else { $Details.Profile.Height })
-        'hw.lcd.density' = $(if ($Details.Smooth) { 300 } else { $Details.Profile.Density })
-        'hw.gpu.enabled' = 'yes'
-        'hw.gpu.mode' = 'host'
+        'hw.lcd.width' = $display.Width
+        'hw.lcd.height' = $display.Height
+        'hw.lcd.density' = $display.Density
     }
+    foreach ($entry in $script:RuntimePolicy.GetEnumerator()) { $values[$entry.Key] = $entry.Value }
     foreach ($entry in $values.GetEnumerator()) {
         $pattern = '(?m)^' + [Regex]::Escape($entry.Key) + '\s*=.*$'
         $line = $entry.Key + ' = ' + $entry.Value
@@ -1638,13 +2044,17 @@ function New-Phone {
             $config = $config.TrimEnd() + "`r`ndisk.dataPartition.size = $($details.Storage)`r`n"
         }
         [IO.File]::WriteAllText((Join-Path $destination 'config.ini'), $config, [Text.UTF8Encoding]::new($false))
+        $edge = if ($details.Smooth) { 720 } else { 0 }
+        $display = Get-ScaledDisplayProfile $profile $edge
+        $originalDisplay = Get-ScaledDisplayProfile $profile
+        [IO.File]::WriteAllText((Join-Path $destination 'android-social-display-original.json'), ($originalDisplay | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
         $profileRecord = [ordered]@{
             label = $profile.Label
             deviceName = $profile.DeviceName
             manufacturer = $profile.Manufacturer
-            width = $(if ($details.Smooth) { 720 } else { $profile.Width })
-            height = $(if ($details.Smooth) { 1560 } else { $profile.Height })
-            density = $(if ($details.Smooth) { 300 } else { $profile.Density })
+            width = $display.Width
+            height = $display.Height
+            density = $display.Density
             performancePreset = $(if ($details.Smooth) { 'social-smooth' } else { 'custom' })
             ramMb = $details.Ram
             cpuCores = $details.Cores
@@ -1664,12 +2074,8 @@ function Start-Phone {
     if ($name -eq $script:TemplateName) { Show-Message 'Create a phone from the protected template instead.'; return }
     $running = Get-RunningAvds
     if ($running.ContainsKey($name)) { Show-Message "$name is already running."; return }
-    if ($running.Count -ge $script:RecommendedRunning) {
-        $answer = [Windows.Forms.MessageBox]::Show($script:Form, 'Two phones are already running. Starting another may slow Windows. Continue?', 'Concurrent limit warning', [Windows.Forms.MessageBoxButtons]::YesNo, [Windows.Forms.MessageBoxIcon]::Warning)
-        if ($answer -ne [Windows.Forms.DialogResult]::Yes) { return }
-    }
-
     try {
+        if (-not (Confirm-PhoneResourceBudget $name $running)) { return }
         $binding = Get-ProxyBinding $name
         if ($binding) {
             $proxyPort = Start-XrayForAvd $name
@@ -1683,16 +2089,18 @@ function Start-Phone {
             throw 'No dedicated proxy is assigned and the shared proxy on port 10808 is unavailable.'
         }
 
+        Set-PhoneRuntimePolicy $name
+        $ownerTag = Get-ManagerOwnerTag
         $info = [Diagnostics.ProcessStartInfo]::new()
         $info.FileName = $script:EmulatorExe
-        $info.Arguments = '-avd "{0}" -no-snapshot-load -accel on -gpu host -no-metrics' -f $name
+        $info.Arguments = '-avd "{0}" -no-snapshot -accel on -gpu {1} -no-metrics -prop qemu.social_owner={2}' -f $name, $script:RuntimePolicy['hw.gpu.mode'], $ownerTag
         $info.UseShellExecute = $false
         $info.CreateNoWindow = $false
         $info.EnvironmentVariables['ANDROID_AVD_HOME'] = $script:AvdRoot
         $info.EnvironmentVariables['ANDROID_EMULATOR_HOME'] = $script:EmulatorHome
         $info.EnvironmentVariables['ADB_VENDOR_KEYS'] = $script:AdbKey
         [void][Diagnostics.Process]::Start($info)
-        Set-Status "$name is starting with $proxyMode."
+        Set-Status "$name is starting with $proxyMode; host GPU requested, cold boot without snapshot writes."
     } catch {
         Stop-XrayForAvd $name
         Show-Message $_.Exception.Message 'Start failed' ([Windows.Forms.MessageBoxIcon]::Error)
@@ -1701,10 +2109,10 @@ function Start-Phone {
 
 function Get-DeviceForAvd {
     param([string]$Name)
-    foreach ($line in (& $script:AdbExe devices 2>$null)) {
+    foreach ($line in (Invoke-OwnedAdb devices 2>$null)) {
         if ($line -match '^(emulator-\d+)\s+device\s*$') {
             $serial = $Matches[1]
-            $avdName = (& $script:AdbExe -s $serial shell getprop ro.boot.qemu.avd_name 2>$null).Trim()
+            $avdName = (Invoke-OwnedAdb -s $serial shell getprop ro.boot.qemu.avd_name 2>$null).Trim()
             if ($avdName -eq $Name) { return $serial }
         }
     }
@@ -1744,7 +2152,7 @@ function Stop-Phone {
     try {
         Set-Status "Stopping $name safely..."
         Stop-DeviceTunnel $serial
-        & $script:AdbExe -s $serial shell reboot -p 2>$null | Out-Null
+        Invoke-OwnedAdb -s $serial shell reboot -p 2>$null | Out-Null
         Stop-XrayForAvd $name
         Set-Status "$name stopped."
     } catch { Show-Message $_.Exception.Message 'Stop failed' ([Windows.Forms.MessageBoxIcon]::Error) }
@@ -1772,102 +2180,146 @@ function Initialize-RunningDevices {
     if ($script:InitializingDevices) { return }
     $script:InitializingDevices = $true
     try {
-        foreach ($line in (& $script:AdbExe devices 2>$null)) {
+        $managedNames = @{}
+        foreach ($managedName in Get-AvdNames) { $managedNames[$managedName] = $true }
+        if ($managedNames.Count -eq 0) { return }
+        $ownerTag = Get-ManagerOwnerTag
+        $devices = @(Invoke-OwnedAdb devices)
+        if ($LASTEXITCODE -ne 0) { throw 'ADB device discovery failed.' }
+        foreach ($line in $devices) {
             if ($line -notmatch '^(emulator-\d+)\s+device\s*$') { continue }
             $serial = $Matches[1]
-            $name = (& $script:AdbExe -s $serial shell getprop ro.boot.qemu.avd_name 2>$null).Trim()
-            $booted = (& $script:AdbExe -s $serial shell getprop sys.boot_completed 2>$null).Trim()
-            if (-not $name -or $name -eq $script:TemplateName -or $booted -ne '1') { continue }
-
-            $binding = Get-ProxyBinding $name
-            if ($binding) {
-                $proxyPort = [int]$binding.port
-                [void](Start-XrayForAvd $name)
-            } elseif (Test-TcpPort $script:SharedProxyPort) {
-                $proxyPort = $script:SharedProxyPort
-            } else {
-                $proxyPort = 0
-            }
-
-            Clear-AndroidSystemProxy $serial
-            if ($proxyPort -gt 0) { Ensure-DeviceTunnel $serial $name $proxyPort }
-            else { Stop-DeviceTunnel $serial }
-
-            $marker = Join-Path $script:AvdRoot ($name + '.avd\.per_device_proxy_v1')
-            if (-not (Test-Path -LiteralPath $marker)) {
-                & $script:AdbExe -s $serial shell cmd media_session volume --stream 3 --set 15 2>$null | Out-Null
-                if ($LASTEXITCODE -ne 0) { & $script:AdbExe -s $serial shell 'for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do input keyevent 24; done' 2>$null | Out-Null }
-                [IO.File]::WriteAllText($marker, (Get-Date).ToString('o'), [Text.UTF8Encoding]::new($false))
-            }
-            if ($proxyPort -gt 0) { Set-Status "$name VPN endpoint ready on port $proxyPort; Internet access not yet verified." }
+            try {
+                $identity = @(Invoke-OwnedAdb -s $serial shell 'getprop ro.boot.qemu.avd_name; getprop sys.boot_completed; cat /proc/sys/kernel/random/boot_id; getprop qemu.social_owner')
+                if ($LASTEXITCODE -ne 0 -or $identity.Count -lt 4) { continue }
+                $name = $identity[0].Trim()
+                if ($name -notmatch '^[A-Za-z0-9_-]+$' -or $name -eq $script:TemplateName -or $identity[1].Trim() -ne '1') { continue }
+                if (-not $managedNames.ContainsKey($name)) { continue }
+                if ($identity[3].Trim() -cne $ownerTag) {
+                    Set-Status "$name background maintenance skipped: restart it from this manager to confirm ownership."
+                    continue
+                }
+                $bootId = $identity[2].Trim()
+                $binding = Get-ProxyBinding $name
+                if ($binding) { $proxyPort = Start-XrayForAvd $name }
+                elseif (Test-TcpPort $script:SharedProxyPort) { $proxyPort = $script:SharedProxyPort }
+                else { $proxyPort = 0 }
+                $healthPath = Join-Path $script:RuntimeRoot ($name + '-vpn-health.json')
+                $key = "$serial/$bootId/$proxyPort/$($script:TunnelVersionCode)"
+                $cached = $false
+                if (Test-Path -LiteralPath $healthPath) {
+                    try {
+                        $health = [IO.File]::ReadAllText($healthPath) | ConvertFrom-Json
+                        $age = ([DateTime]::UtcNow - [DateTime]::Parse($health.checkedAt).ToUniversalTime()).TotalMinutes
+                        $cached = $health.key -eq $key -and $age -ge 0 -and $age -lt 60
+                    } catch { }
+                }
+                if ($proxyPort -gt 0) {
+                    $status = Invoke-DeviceTunnelControl $serial STATUS
+                    $endpointPattern = 'running=true;host=127\.0\.0\.1;port=' + $proxyPort + ';'
+                    $reverse = (Invoke-OwnedAdb -s $serial reverse --list | Out-String)
+                    if ($cached -and $status -match $endpointPattern -and $reverse -match ('(?m)\btcp:' + $proxyPort + '\s+tcp:' + $proxyPort + '\s*$')) { continue }
+                    Ensure-DeviceTunnel $serial $name $proxyPort
+                } else {
+                    if ($cached) { continue }
+                    Stop-DeviceTunnel $serial
+                }
+                $marker = Join-Path $script:AvdRoot ($name + '.avd\.per_device_proxy_v1')
+                if (-not (Test-Path -LiteralPath $marker)) {
+                    Invoke-OwnedAdb -s $serial shell cmd media_session volume --stream 3 --set 15 | Out-Null
+                    if ($LASTEXITCODE -eq 0) { [IO.File]::WriteAllText($marker, (Get-Date).ToString('o'), [Text.UTF8Encoding]::new($false)) }
+                }
+                $healthText = @{ key = $key; checkedAt = [DateTime]::UtcNow.ToString('o') } | ConvertTo-Json
+                [IO.File]::WriteAllText($healthPath, $healthText, [Text.UTF8Encoding]::new($false))
+                if ($proxyPort -gt 0) { Set-Status "$name VPN endpoint ready; Internet access not yet verified." }
+            } catch { Set-Status "Device $serial background check failed: $($_.Exception.Message)" }
         }
-    } catch {
-        if ($_.Exception.Message -notmatch '(?i)error:\s*(closed|offline)|device.*not found') {
-            Set-Status "Device initialization failed: $($_.Exception.Message)"
-        }
-    } finally { $script:InitializingDevices = $false }
+    } catch { Set-Status "Device discovery failed: $($_.Exception.Message)" }
+    finally { $script:InitializingDevices = $false }
 }
 
 if ($Maintenance) {
     $script:AutoLatencyTimer.Stop()
     function Set-Status { param([string]$Text) $script:WorkerStatus = $Text }
     function Set-PhoneLatencyResult { param([string]$Name, [string]$Text) $script:LatencyResults[$Name] = $Text }
-    Initialize-RunningDevices
-    if ($MeasureLatency) {
-        foreach ($deviceName in Get-AvdNames) { Test-PhoneProxy -TargetName $deviceName -Automatic }
+    try {
+        Initialize-RunningDevices
+        if ($MeasureLatency) {
+            foreach ($deviceName in Get-AvdNames) { Test-PhoneProxy -TargetName $deviceName -Automatic }
+        }
+        $snapshot = [ordered]@{
+            running = @((Get-RunningAvds).Keys)
+            latency = $script:LatencyResults
+            status = $script:WorkerStatus
+        } | ConvertTo-Json -Depth 6
+        [IO.File]::WriteAllText($SnapshotPath, $snapshot, [Text.UTF8Encoding]::new($false))
+    } finally {
+        if ($script:OwnedAdbJob) { $script:OwnedAdbJob.Dispose(); $script:OwnedAdbJob = $null }
+        $script:AutoLatencyTimer.Dispose()
     }
-    $snapshot = [ordered]@{
-        running = @((Get-RunningAvds).Keys)
-        latency = $script:LatencyResults
-        status = $script:WorkerStatus
-    } | ConvertTo-Json -Depth 6
-    [IO.File]::WriteAllText($SnapshotPath, $snapshot, [Text.UTF8Encoding]::new($false))
     return
 }
 
 function Update-BackgroundMaintenance {
+    if ($script:Closing) { return }
+    if ([DateTime]::UtcNow -lt $script:MaintenanceRetryAfter) { return }
     if ($script:MaintenanceProcess) {
         if (-not $script:MaintenanceProcess.HasExited) {
             if (([DateTime]::UtcNow - $script:MaintenanceStartedAt).TotalSeconds -lt $script:MaintenanceTimeoutSeconds) { return }
+            $script:MaintenanceRetryAfter = [DateTime]::UtcNow.AddSeconds(30)
+            if ($script:MaintenanceRequestedLatency) { $script:LatencyPending = $true }
             try {
-                $script:MaintenanceProcess.Kill()
-                Set-Status 'Background task timed out; retrying shortly. Network state is unverified.'
-            } catch {
-                Set-Status "Unable to stop timed-out background task: $($_.Exception.Message)"
-                return
-            }
-            $script:MaintenanceProcess.Dispose()
-            $script:MaintenanceProcess = $null
-            $script:NextMaintenance = [DateTime]::UtcNow.AddSeconds(15)
+                Stop-BackgroundMaintenance
+                Set-Status 'Background check timed out; owned ADB clients were released. Retrying in 30 seconds.'
+            } catch { Set-Status $_.Exception.Message }
             return
         }
+        $completed = $false
         try {
-            if ($script:MaintenanceProcess.ExitCode -eq 0 -and (Test-Path -LiteralPath $script:SnapshotFile)) {
-                $snapshot = [IO.File]::ReadAllText($script:SnapshotFile) | ConvertFrom-Json
-                $script:RunningSnapshot = @{}
-                foreach ($deviceName in $snapshot.running) { $script:RunningSnapshot[$deviceName] = $true }
-                foreach ($entry in $snapshot.latency.PSObject.Properties) { $script:LatencyResults[$entry.Name] = [string]$entry.Value }
-                Update-AvdList
-                Sync-LatencyUi
-                Sync-ActionStates
-                Sync-EmulatorWindowPlacement
-                if ($snapshot.status) { Set-Status $snapshot.status }
-            } else { Set-Status 'Background task failed; network state is unverified. Retrying shortly.' }
-        } catch {
-            Set-Status "Unable to load background results: $($_.Exception.Message)"
-        } finally {
-            $script:MaintenanceProcess.Dispose()
-            $script:MaintenanceProcess = $null
-            $script:NextMaintenance = [DateTime]::UtcNow.AddSeconds(8)
+            if ($script:MaintenanceProcess.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $script:SnapshotFile)) { throw 'Background check did not produce a result.' }
+            $snapshot = [IO.File]::ReadAllText($script:SnapshotFile) | ConvertFrom-Json
+            $script:RunningSnapshot = @{}
+            foreach ($deviceName in $snapshot.running) { $script:RunningSnapshot[$deviceName] = $true }
+            foreach ($entry in $snapshot.latency.PSObject.Properties) { $script:LatencyResults[$entry.Name] = [string]$entry.Value }
+            Update-AvdList
+            Sync-LatencyUi
+            Sync-ActionStates
+            Sync-EmulatorWindowPlacement
+            if ($snapshot.status) { Set-Status $snapshot.status }
+            $completed = $true
+        } catch { Set-Status "Unable to load background results: $($_.Exception.Message)" }
+        finally {
+            if (-not $completed) {
+                $script:MaintenanceRetryAfter = [DateTime]::UtcNow.AddSeconds(30)
+                if ($script:MaintenanceRequestedLatency) { $script:LatencyPending = $true }
+            }
+            $script:NextMaintenance = [DateTime]::UtcNow.AddSeconds(30)
+            try { Stop-BackgroundMaintenance }
+            catch { $script:MaintenanceRetryAfter = [DateTime]::UtcNow.AddSeconds(30); throw }
         }
     }
+    if ([DateTime]::UtcNow -lt $script:MaintenanceRetryAfter) { return }
     if ([DateTime]::UtcNow -lt $script:NextMaintenance -and -not $script:LatencyPending) { return }
-    $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Maintenance -SnapshotPath "{1}"' -f $PSCommandPath, $script:SnapshotFile
-    if ($script:LatencyPending) { $arguments += ' -MeasureLatency' }
-    $script:MaintenanceTimeoutSeconds = if ($script:LatencyPending) { [Math]::Max(90, 45 * @(Get-AvdNames).Count) } else { 60 }
-    $script:MaintenanceStartedAt = [DateTime]::UtcNow
-    $script:MaintenanceProcess = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -ArgumentList $arguments -WindowStyle Hidden -PassThru
-    $script:LatencyPending = $false
+    try {
+        if ($script:BackgroundAdbJob) { Stop-BackgroundMaintenance }
+        $jobName = 'Local\AndroidSocialWorker-' + [Guid]::NewGuid().ToString('N')
+        $script:BackgroundAdbJob = [OwnedAdbJob]::new($jobName)
+        $script:SnapshotFile = Join-Path $script:RuntimeRoot ('manager-status-' + $PID + '-' + [Guid]::NewGuid().ToString('N') + '.json')
+        $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Maintenance -SnapshotPath "{1}" -AdbJobName "{2}" -OwnerPid {3} -OwnerStartTicks {4}' -f $PSCommandPath, $script:SnapshotFile, $jobName, $PID, ([Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().Ticks)
+        $script:MaintenanceRequestedLatency = [bool]$script:LatencyPending
+        if ($script:MaintenanceRequestedLatency) { $arguments += ' -MeasureLatency' }
+        $script:MaintenanceTimeoutSeconds = [Math]::Max(180, 90 * @(Get-AvdNames).Count)
+        $script:MaintenanceStartedAt = [DateTime]::UtcNow
+        $script:MaintenanceProcess = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -ArgumentList $arguments -WindowStyle Hidden -PassThru
+        $script:LatencyPending = $false
+    } catch {
+        $script:MaintenanceRetryAfter = [DateTime]::UtcNow.AddSeconds(30)
+        $script:NextMaintenance = $script:MaintenanceRetryAfter
+        if ($script:BackgroundAdbJob -and $script:BackgroundAdbJob.StopClients(0)) {
+            $script:BackgroundAdbJob.Dispose(); $script:BackgroundAdbJob = $null
+        }
+        throw
+    }
 }
 
 if ($SelfTest) {
@@ -1927,6 +2379,8 @@ function New-RoundedRectanglePath {
 
 $script:RunningSnapshot = @{}
 $script:NextMaintenance = [DateTime]::MinValue
+$script:MaintenanceRetryAfter = [DateTime]::MinValue
+$script:MaintenanceRequestedLatency = $false
 $script:SnapshotFile = Join-Path $script:RuntimeRoot ('manager-status-' + $PID + '.json')
 $script:CardFonts = @{
     Name = [Drawing.Font]::new('Bahnschrift SemiBold', 14)
@@ -2208,7 +2662,13 @@ $timer.Add_Tick({
 $timer.Start()
 $script:Form.Add_ResizeBegin({ $script:MovingWindow = $true })
 $script:Form.Add_ResizeEnd({ $script:MovingWindow = $false })
-$script:Form.Add_FormClosed({ $script:AutoLatencyTimer.Stop() })
+$script:Form.Add_FormClosed({
+    $script:Closing = $true
+    $timer.Stop()
+    $script:AutoLatencyTimer.Stop()
+    try { Stop-BackgroundMaintenance } catch { }
+    if ($script:OwnedAdbJob) { $script:OwnedAdbJob.Dispose(); $script:OwnedAdbJob = $null }
+})
 if ($CapturePreview) {
     Update-AvdList
     Sync-LatencyUi
